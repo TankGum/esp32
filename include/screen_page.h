@@ -49,14 +49,23 @@ static const char *SCREEN_PAGE_HTML = R"rawliteral(
   </div>
 
   <div class="card" id="askCard" hidden>
-    <h2>Hỏi AI bằng giọng nói (Gemini)</h2>
-    <button id="askBtn">Bắt đầu hỏi</button>
+    <h2>Hỏi AI bằng giọng nói</h2>
+    <div class="row">Nền tảng
+      <select id="askProvider" style="flex:1;font-size:16px;padding:6px">
+        <option value="gemini">Gemini (Google)</option>
+        <option value="groq">Groq (Whisper + chat)</option>
+      </select>
+    </div>
+    <div class="row">
+      <button id="askBtn">Bắt đầu hỏi</button>
+      <button id="askCancel" class="grey" hidden>Hủy</button>
+    </div>
     <div id="askInfo" class="meta"></div>
     <div id="askQ" style="color:#1565c0;margin-top:8px;white-space:pre-wrap"></div>
     <div id="askA" style="margin-top:6px;white-space:pre-wrap"></div>
     <details id="askSetup" style="margin-top:10px">
-      <summary>Khóa API</summary>
-      <input id="askKey" type="password" autocomplete="off" placeholder="Dán khóa Gemini (aistudio.google.com → Get API key)" style="width:100%;box-sizing:border-box;font-size:16px;padding:8px;margin-top:8px">
+      <summary id="askSetupTitle">Khóa API</summary>
+      <input id="askKey" type="password" autocomplete="off" placeholder="Dán khóa API" style="width:100%;box-sizing:border-box;font-size:16px;padding:8px;margin-top:8px">
       <input id="askModel" placeholder="Model" style="width:100%;box-sizing:border-box;font-size:16px;padding:8px;margin-top:8px">
       <button id="askSave" class="grey">Lưu</button>
     </details>
@@ -406,33 +415,47 @@ static const char *SCREEN_PAGE_HTML = R"rawliteral(
   recInfo();
   setInterval(recInfo, 2000);
 
-  let askState = '', askModelSet = false;
+  let askState = '', askShownProvider = '';
+  const ASK_KEY_HINT = { gemini: 'Dán khóa Gemini (aistudio.google.com → Get API key)', groq: 'Dán khóa Groq (console.groq.com → API Keys)' };
   function askInfo() {
     fetch('/ask').then(r => r.ok ? r.json() : Promise.reject()).then(d => {
       $('askCard').hidden = false;
       askState = d.state;
+      if (d.provider !== askShownProvider) { // provider changed (here or with the knob): refresh its fields
+        askShownProvider = d.provider;
+        $('askProvider').value = d.provider;
+        $('askModel').value = d.model;
+        $('askKey').placeholder = ASK_KEY_HINT[d.provider] || 'Dán khóa API';
+        $('askSetupTitle').textContent = 'Khóa API ' + $('askProvider').selectedOptions[0].textContent + (d.hasKey ? ' (đã có)' : '');
+      }
       if (!d.hasKey) $('askSetup').open = true;
-      if (!askModelSet) { $('askModel').value = d.model; askModelSet = true; }
       $('askBtn').textContent = d.state === 'recording' ? 'Dừng và gửi' : d.state === 'thinking' ? 'Đang chờ trả lời...' : 'Bắt đầu hỏi';
       $('askBtn').style.background = d.state === 'recording' ? '#e53935' : '';
       $('askBtn').disabled = d.state === 'thinking' || !d.hasKey;
+      $('askCancel').hidden = !(d.state === 'recording' || d.state === 'thinking');
       $('askInfo').textContent = !d.hasKey ? 'Chưa có khóa API.'
         : d.state === 'recording' ? 'Đang nghe... ' + d.elapsedS + ' giây'
         : d.state === 'thinking' ? 'Gemini đang trả lời... ' + d.elapsedS + ' giây'
         : d.state === 'failed' ? 'Lỗi: ' + d.error
         : d.state === 'answer' ? 'Trả lời sau ' + (d.tookMs / 1000).toFixed(1) + ' giây' : '';
-      $('askQ').textContent = d.state === 'answer' && d.question ? 'Bạn: ' + d.question : '';
-      $('askA').textContent = d.state === 'answer' ? d.answer : '';
+      // the last answer stays visible here after the board's screen went back to Ready
+      const showLast = d.state === 'answer' || d.state === 'idle';
+      $('askQ').textContent = showLast && d.question ? 'Bạn: ' + d.question : '';
+      $('askA').textContent = showLast ? d.answer : '';
     }).catch(() => {}); // firmware without Ask AI: the card stays hidden
   }
   $('askBtn').onclick = () => fetch('/ask/press', { method: 'POST' }).then(askInfo);
+  $('askCancel').onclick = () => fetch('/ask/cancel', { method: 'POST' }).then(r => r.text()).then(t => { say(t); askInfo(); });
+  $('askProvider').onchange = () => fetch('/ask/key', { method: 'POST', body: new URLSearchParams({ provider: $('askProvider').value }) })
+    .then(r => r.text()).then(t => { say(t); askInfo(); });
   $('askSave').onclick = () => {
-    const data = { model: $('askModel').value.trim() };
+    const data = { provider: $('askProvider').value, model: $('askModel').value.trim() };
     if ($('askKey').value.trim()) data.key = $('askKey').value.trim();
     fetch('/ask/key', { method: 'POST', body: new URLSearchParams(data) }).then(r => r.text()).then(t => {
       say(t);
       $('askKey').value = '';
       $('askSetup').open = false;
+      askShownProvider = ''; // re-read the "(đã có)" state
       askInfo();
     });
   };

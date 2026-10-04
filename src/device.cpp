@@ -5,22 +5,28 @@
 #include <DNSServer.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <Update.h>
+#include <StreamString.h>
 #include <ArduinoJson.h>
 #include <SPI.h>
 #include <FFat.h>
 #include <Preferences.h>
 #include <time.h>
 #include <driver/i2s.h>
+#include <driver/adc.h>
+#include <driver/rtc_io.h>
+#include <esp_adc_cal.h>
 #include <vector>
 #include <algorithm>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
-#include <U8g2_for_Adafruit_GFX.h>
 #include <mbedtls/base64.h>
 #include "json_escape.h"
 #include "rgb_led.h"
 #include "screen_page.h"
 #include "wifi_config.h"
+#include "ui_fonts.h"
+#include "ancs_client.h"
 
 #define TFT_SCLK 12
 #define TFT_MOSI 11
@@ -28,11 +34,12 @@
 #define TFT_DC    9
 #define TFT_RST  13
 #define BUTTON    0 // the BOOT button: tap = next / act, hold = open / back
-// EC11 rotary encoder (optional): turn = move, press = select, hold = back. With nothing
-// wired the pins sit high through their pull-ups, so the firmware behaves as before.
-#define ENC_A     4
-#define ENC_B     5
-#define ENC_SW    6
+// Two push buttons replace the rotary encoder (one leg on the pin, the other to GND):
+// a tap moves up / down like turning the knob did, holding either one selects.
+#define BTN_UP    4
+#define BTN_DOWN  5
+#define BTN_OK    3 // OK / select button. GPIO3 is a strapping pin, but only for JTAG source selection
+                    // when an eFuse is burned (not on this board), so a button here is safe at boot.
 #define BACK_BTN  7 // optional "back" button: one leg here, the other to GND
 
 const int W = 240, H = 320;
@@ -42,10 +49,67 @@ const int MAX_PAGES = 800;
 const unsigned long HOLD_MS = 700;
 const char *HOSTNAME = "esp32";
 
-Adafruit_ST7789 tft(&SPI, TFT_CS, TFT_DC, TFT_RST);
-U8G2_FOR_ADAFRUIT_GFX u8f; // UTF-8 text (Vietnamese) on the same panel
+// The panel is write-only (no MISO wire), so a copy of what is on it is kept in PSRAM: every
+// drawing call lands in both. GET /screen returns that copy as a BMP, which is how a layout is
+// checked without anyone looking at the board.
+class MirrorTFT : public Adafruit_ST7789 {
+public:
+    using Adafruit_ST7789::Adafruit_ST7789;
+    using Adafruit_ST7789::drawRGBBitmap;
+    uint16_t *mirror = nullptr;
+
+    void mirrorFill(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t c) {
+        if (!mirror || !clip(x, y, w, h)) return;
+        for (int r = 0; r < h; r++) {
+            uint16_t *p = mirror + (y + r) * W + x;
+            for (int i = 0; i < w; i++) p[i] = c;
+        }
+    }
+    void drawPixel(int16_t x, int16_t y, uint16_t c) override { mirrorFill(x, y, 1, 1, c); Adafruit_ST7789::drawPixel(x, y, c); }
+    void writePixel(int16_t x, int16_t y, uint16_t c) override { mirrorFill(x, y, 1, 1, c); Adafruit_ST7789::writePixel(x, y, c); }
+    void writeFillRect(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t c) override {
+        mirrorFill(x, y, w, h, c);
+        Adafruit_ST7789::writeFillRect(x, y, w, h, c);
+    }
+    void writeFastHLine(int16_t x, int16_t y, int16_t w, uint16_t c) override { mirrorFill(x, y, w, 1, c); Adafruit_ST7789::writeFastHLine(x, y, w, c); }
+    void writeFastVLine(int16_t x, int16_t y, int16_t h, uint16_t c) override { mirrorFill(x, y, 1, h, c); Adafruit_ST7789::writeFastVLine(x, y, h, c); }
+    void fillRect(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t c) override { mirrorFill(x, y, w, h, c); Adafruit_ST7789::fillRect(x, y, w, h, c); }
+    void drawFastHLine(int16_t x, int16_t y, int16_t w, uint16_t c) override { mirrorFill(x, y, w, 1, c); Adafruit_ST7789::drawFastHLine(x, y, w, c); }
+    void drawFastVLine(int16_t x, int16_t y, int16_t h, uint16_t c) override { mirrorFill(x, y, 1, h, c); Adafruit_ST7789::drawFastVLine(x, y, h, c); }
+    void drawRGBBitmap(int16_t x, int16_t y, uint16_t *pc, int16_t w, int16_t h) {
+        if (mirror) {
+            for (int r = 0; r < h; r++) {
+                int yy = y + r;
+                if (yy < 0 || yy >= H) continue;
+                for (int i = 0; i < w; i++) {
+                    int xx = x + i;
+                    if (xx >= 0 && xx < W) mirror[yy * W + xx] = pc[r * w + i];
+                }
+            }
+        }
+        Adafruit_ST7789::drawRGBBitmap(x, y, pc, w, h);
+    }
+
+private:
+    static bool clip(int16_t &x, int16_t &y, int16_t &w, int16_t &h) {
+        if (x < 0) { w += x; x = 0; }
+        if (y < 0) { h += y; y = 0; }
+        if (x + w > W) w = W - x;
+        if (y + h > H) h = H - y;
+        return w > 0 && h > 0;
+    }
+};
+MirrorTFT tft(&SPI, TFT_CS, TFT_DC, TFT_RST);
+
+// Screen language, picked in Settings and kept in NVS ("ui"/"lang"). The UI fonts carry the
+// Vietnamese letters, so both languages are drawn the same way.
+enum UiLang : uint8_t { LANG_EN, LANG_VI };
+uint8_t uiLang = LANG_EN;
+const char *T(const char *en, const char *vi) { return uiLang == LANG_VI ? vi : en; }
 WebServer server(80);
 Preferences prefs;
+String otaError;
+size_t otaBytes = 0;
 
 uint16_t lineBuf[W];
 uint32_t pixelsDrawn = 0, bytesReceived = 0;
@@ -60,11 +124,10 @@ int recvSlot = -1; // document slot currently being uploaded
 
 // The screen shows the home clock (appIndex == HOME, -2), the menu (-1) or one running app.
 int appIndex = -1, menuSel = 0;
-volatile uint32_t encEdgesA = 0, encEdgesB = 0; // per-contact encoder edge counts, to spot a dead wire
 long homeTimerShownSec = -2; // second last drawn on the home clock's timer line
 
 // Press counters, so wiring can be checked over the network instead of by watching the screen.
-uint32_t bootTaps = 0, knobTaps = 0, backTaps = 0, rotations = 0;
+uint32_t bootTaps = 0, knobTaps = 0, backTaps = 0, upTaps = 0, downTaps = 0;
 
 // Each document is a folder /d<slot> holding its pages and a name.txt, so several documents
 // live on the board at once and the reader picks one.
@@ -128,8 +191,35 @@ void docSavePage(int slot, int page) {
 // Battery: a 3.7 V LiPo through two equal resistors into GPIO1 (ADC1, which keeps working
 // while WiFi is on). With no battery wired the pin floats, so a reading outside the range a
 // LiPo can produce means "running on USB" rather than a made-up percentage.
+// The battery feeds the 3V3 rail through the charger module, so measuring the battery means
+// measuring the chip's own supply. No external parts: GPIO1 (ADC1 channel 0, left unconnected)
+// has both its internal pull-up (to 3V3) and pull-down (to GND) on, which makes a divider inside
+// the chip. Those resistors are not matched, so the ratio is calibrated per board: with USB
+// power the rail is the board regulator's 3.30 V (POST /battery/calibrate?volts=3.30).
 #define BATTERY_PIN 1
-const float BATTERY_DIVIDER = 2.0f;
+const float BATTERY_DIVIDER_DEFAULT = 3.30f / 1.512f; // measured on this board, 2026-10-03
+float batteryDivider = BATTERY_DIVIDER_DEFAULT;
+esp_adc_cal_characteristics_t batteryCal;
+
+void batteryBegin() {
+    adc1_config_width(ADC_WIDTH_BIT_12);
+    adc1_config_channel_atten(ADC1_CHANNEL_0, ADC_ATTEN_DB_11);
+    esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_11, ADC_WIDTH_BIT_12, 1100, &batteryCal);
+    rtc_gpio_pullup_en(GPIO_NUM_1);
+    rtc_gpio_pulldown_en(GPIO_NUM_1);
+    prefs.begin("battery", true);
+    batteryDivider = prefs.getFloat("divider", BATTERY_DIVIDER_DEFAULT);
+    prefs.end();
+}
+
+// Median of a burst in mV at the pin, before the divider.
+uint32_t batteryPinMv() {
+    const int N = 15;
+    uint32_t s[N];
+    for (int i = 0; i < N; i++) s[i] = esp_adc_cal_raw_to_voltage(adc1_get_raw(ADC1_CHANNEL_0), &batteryCal);
+    std::sort(s, s + N);
+    return s[N / 2];
+}
 
 // The ADC is noisy by tens of mV and the LiPo curve is steep around 3.7 V, so a raw reading
 // would jump several percent between samples. Take the median of a burst (kills spikes from
@@ -137,31 +227,105 @@ const float BATTERY_DIVIDER = 2.0f;
 float batteryVoltsRaw() {
     const int N = 15;
     uint32_t s[N];
-    for (int i = 0; i < N; i++) s[i] = analogReadMilliVolts(BATTERY_PIN);
+    for (int i = 0; i < N; i++) s[i] = esp_adc_cal_raw_to_voltage(adc1_get_raw(ADC1_CHANNEL_0), &batteryCal);
     for (int i = 1; i < N; i++) { // insertion sort, N is tiny
         uint32_t key = s[i];
         int j = i - 1;
         for (; j >= 0 && s[j] > key; j--) s[j + 1] = s[j];
         s[j + 1] = key;
     }
-    return s[N / 2] * BATTERY_DIVIDER / 1000.0f;
+    return s[N / 2] * batteryDivider / 1000.0f;
 }
 
 float batterySmoothed = 0;
 float batteryRecent[10]; // last 5 seconds of raw readings
 int batteryRecentAt = 0, batteryRecentCount = 0;
 
+void batteryChargeUpdate(float v);
 void batteryUpdate() { // called about twice a second: time constant is roughly 10 seconds
     float v = batteryVoltsRaw();
     batterySmoothed = batterySmoothed == 0 ? v : batterySmoothed + (v - batterySmoothed) * 0.05f;
     batteryRecent[batteryRecentAt] = v;
     batteryRecentAt = (batteryRecentAt + 1) % 10;
     if (batteryRecentCount < 10) batteryRecentCount++;
+    batteryChargeUpdate(v);
 }
 
 float batteryVolts() {
     if (batterySmoothed == 0) batteryUpdate();
     return batterySmoothed;
+}
+
+// Charging, inferred from the voltage alone (nothing is wired to the charger's CHRG pin):
+// plugging the charger in lifts the battery's terminal voltage by about 0.3 V within seconds
+// (measured: 3.66 -> 3.96 V, and 3.95 -> 3.71 V on unplugging) while the readings wobble by up
+// to 0.08 V, so a step has to pass 0.15 V.
+// A step is the median of the last 3 s against the median of 10-13 s earlier. A slow rise
+// over 5 minutes catches a charger that was already plugged in at power-on.
+bool batteryCharging = false;
+float batteryChargeLift = 0.2f, batteryChargeFrom = 4.0f; // size of the plug-in step, and the voltage right after it
+float batteryHist[30]; // 15 s of raw readings
+int batteryHistAt = 0, batteryHistN = 0;
+float batteryTrend[6]; // the smoothed voltage once a minute
+int batteryTrendN = 0;
+unsigned long batteryTrendMs = 0;
+
+float median6(const float *v) {
+    float t[6];
+    memcpy(t, v, sizeof(t));
+    std::sort(t, t + 6);
+    return (t[2] + t[3]) / 2;
+}
+
+void batteryChargeReset() {
+    batteryHistN = 0;
+    batteryTrendN = 0;
+    batteryTrendMs = millis();
+}
+
+void batteryChargeUpdate(float v) {
+    if (v < 3.36f) { // USB power or no battery
+        batteryCharging = false;
+        batteryChargeReset();
+        return;
+    }
+    batteryHist[batteryHistAt] = v;
+    batteryHistAt = (batteryHistAt + 1) % 30;
+    if (batteryHistN < 30) batteryHistN++;
+    if (batteryHistN == 30) {
+        float recent[6], older[6];
+        for (int i = 0; i < 6; i++) {
+            recent[i] = batteryHist[(batteryHistAt - 1 - i + 60) % 30];
+            older[i] = batteryHist[(batteryHistAt - 21 - i + 60) % 30];
+        }
+        float step = median6(recent) - median6(older);
+        if ((step > 0.15f && !batteryCharging) || (step < -0.15f && batteryCharging)) {
+            batteryCharging = step > 0;
+            if (batteryCharging) {
+                batteryChargeLift = min(step, 0.4f);
+                batteryChargeFrom = median6(recent);
+            }
+            Serial.printf("Charger %s (step %+.2f V)\n", batteryCharging ? "plugged in" : "unplugged", step);
+            batteryChargeReset();
+            return;
+        }
+    }
+    if (millis() - batteryTrendMs < 60000) return;
+    batteryTrendMs = millis();
+    if (batteryTrendN == 6) {
+        memmove(batteryTrend, batteryTrend + 1, sizeof(float) * 5);
+        batteryTrendN = 5;
+    }
+    batteryTrend[batteryTrendN++] = batterySmoothed;
+    if (batteryTrendN < 6) return;
+    float rise = batteryTrend[5] - batteryTrend[0];
+    // Near full the charger stops and restarts by itself, so a slow fall up there is not an unplug.
+    if (!batteryCharging && rise > 0.04f) { // no step seen: assume a typical lift
+        batteryCharging = true;
+        batteryChargeLift = 0.2f;
+        batteryChargeFrom = batterySmoothed;
+    }
+    else if (batteryCharging && rise < -0.03f && v < 4.0f) batteryCharging = false;
 }
 
 float batterySpread() { // how much the raw readings move: a wired battery barely moves
@@ -174,11 +338,17 @@ float batterySpread() { // how much the raw readings move: a wired battery barel
     return hi - lo;
 }
 
-// An unwired ADC pin floats and drifts across volts, which would otherwise look like a
-// battery, so a reading only counts as a battery when it is also steady.
-bool batteryPresent(float v) { return v > 2.8f && v < 4.6f && batterySpread() < 0.25f; }
+// On USB the rail sits at the regulator's 3.30 V; a LiPo that low is all but empty (the board
+// browns out just below it), so a steady reading under 3.36 V is shown as USB power.
+bool batteryPresent(float v) { return v > 3.36f && v < 4.6f && batterySpread() < 0.25f; }
 
 int batteryPercent(float v) { // a LiPo's voltage is not linear in charge, so interpolate a curve
+    // The charge current lifts the terminal voltage above the resting one, by the step seen at
+    // plug-in; the lift shrinks to nothing as the charger tapers off towards 4.2 V.
+    if (batteryCharging && batteryChargeFrom < 4.19f) {
+        float left = constrain((4.2f - v) / (4.2f - batteryChargeFrom), 0.0f, 1.0f);
+        v -= batteryChargeLift * left;
+    }
     const float curve[][2] = {{3.30f, 0}, {3.50f, 10}, {3.60f, 20}, {3.70f, 40},
                               {3.80f, 60}, {3.90f, 75}, {4.00f, 88}, {4.20f, 100}};
     if (v <= curve[0][0]) return 0;
@@ -190,28 +360,197 @@ int batteryPercent(float v) { // a LiPo's voltage is not linear in charge, so in
     return 100;
 }
 
-// Shared look: black screens, a light-blue accent (also the clock's weekday) and a quiet divider.
-const uint16_t ACCENT = ((90 & 0xF8) << 8) | ((200 & 0xFC) << 3) | (255 >> 3);
-const uint16_t DIVIDER = ((45 & 0xF8) << 8) | ((45 & 0xFC) << 3) | (52 >> 3);
-const uint16_t MUTED = ((160 & 0xF8) << 8) | ((160 & 0xFC) << 3) | (160 >> 3);
+// ---------- UI kit ----------
+// Black screens with lifted cards, one blue accent, and anti-aliased Be Vietnam Pro text
+// (include/ui_fonts.h). Colours are RGB565.
+constexpr uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) { return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3); }
+const uint16_t UI_BG = 0x0000;
+const uint16_t UI_TXT = rgb565(240, 242, 247), UI_TXT2 = rgb565(205, 210, 220), UI_SUB = rgb565(138, 146, 160);
+const uint16_t UI_CARD = rgb565(24, 28, 37), UI_CARD_SEL = rgb565(34, 42, 58), UI_LINE = rgb565(44, 50, 62);
+const uint16_t ACCENT = rgb565(92, 170, 255), MUTED = UI_SUB, DIVIDER = UI_LINE;
+const uint16_t UI_GREEN = rgb565(80, 220, 120), UI_YELLOW = rgb565(255, 204, 0), UI_RED = rgb565(255, 90, 80);
+const uint16_t UI_ORANGE = rgb565(255, 159, 10);
+const int CONTENT_Y = 66; // below the status bar and the title
 
-// Battery indicator in the title bar, so every screen that has one shows it.
-void drawBatteryIcon() {
-    const int x = 190, y = 5, w = 36, h = 14;
+const int UI_BUF_PIXELS = W * 100;
+uint16_t *uiBuf = nullptr; // a box of text is composed here, then pushed in one go
+enum { AL_LEFT, AL_CENTER, AL_RIGHT };
+
+uint32_t utf8Next(const char *&p) {
+    uint8_t c = *p++;
+    if (c < 0x80) return c;
+    int n = (c >> 5) == 6 ? 1 : (c >> 4) == 14 ? 2 : (c >> 3) == 30 ? 3 : 0;
+    uint32_t cp = c & (0x3F >> n);
+    while (n-- && (*p & 0xC0) == 0x80) cp = (cp << 6) | (*p++ & 0x3F);
+    return cp;
+}
+
+const AAGlyph *aaFind(const AAFont &f, uint32_t code) {
+    int lo = 0, hi = f.count - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (f.glyphs[mid].code == code) return &f.glyphs[mid];
+        if (f.glyphs[mid].code < code) lo = mid + 1;
+        else hi = mid - 1;
+    }
+    return nullptr;
+}
+
+int aaWidth(const AAFont &f, const String &s) {
+    int w = 0;
+    for (const char *p = s.c_str(); *p;) {
+        const AAGlyph *g = aaFind(f, utf8Next(p));
+        w += g ? g->adv : f.glyphs[0].adv; // unknown characters take a space
+    }
+    return w;
+}
+
+int uiTextH(const AAFont &f) { return f.ascent + f.descent; }
+
+inline uint16_t blend565(uint16_t bg, uint16_t fg, uint8_t a) { // a = coverage 0..15
+    if (a >= 15) return fg;
+    uint8_t b = 15 - a;
+    uint16_t r = ((fg >> 11) * a + (bg >> 11) * b) / 15;
+    uint16_t g = (((fg >> 5) & 63) * a + ((bg >> 5) & 63) * b) / 15;
+    uint16_t bl = ((fg & 31) * a + (bg & 31) * b) / 15;
+    return (r << 11) | (g << 5) | bl;
+}
+
+// Blends `s` into a w x h pixel buffer, pen starting at (penX, baseY) on the baseline.
+void aaDraw(const AAFont &f, uint16_t *buf, int bw, int bh, int penX, int baseY, const char *s, uint16_t fg) {
+    for (const char *p = s; *p;) {
+        const AAGlyph *g = aaFind(f, utf8Next(p));
+        if (!g) {
+            penX += f.glyphs[0].adv;
+            continue;
+        }
+        const uint8_t *bits = f.bits + g->offset;
+        for (int yy = 0; yy < g->h; yy++) {
+            int by = baseY + g->dy + yy;
+            if (by < 0 || by >= bh) continue;
+            for (int xx = 0; xx < g->w; xx++) {
+                int bx = penX + g->dx + xx;
+                if (bx < 0 || bx >= bw) continue;
+                int i = yy * g->w + xx;
+                uint8_t a = (bits[i >> 1] >> (i & 1 ? 0 : 4)) & 15;
+                if (a) buf[by * bw + bx] = blend565(buf[by * bw + bx], fg, a);
+            }
+        }
+        penX += g->adv;
+    }
+}
+
+// One line of text in a box (x, y, w, h), drawn together with the box's background and pushed
+// to the panel in one go, so a value that changes redraws without flicker. The text is centred
+// vertically. `bgImg`, when given, is a full-screen picture the box shows through instead of a
+// flat colour; `shadow` adds a dark copy offset by a pixel, for text over a photo.
+void uiBox(const AAFont &f, int x, int y, int w, int h, const String &s, uint16_t fg, uint16_t bg,
+           uint8_t align = AL_LEFT, const uint16_t *bgImg = nullptr, bool shadow = false) {
+    int shift = 0;
+    if (x < 0) {
+        shift = x;
+        w += x;
+        x = 0;
+    }
+    if (x + w > W) w = W - x;
+    if (y < 0) {
+        h += y;
+        y = 0;
+    }
+    if (y + h > H) h = H - y;
+    if (!uiBuf || w <= 0 || h <= 0 || w * h > UI_BUF_PIXELS) return;
+    for (int r = 0; r < h; r++) {
+        if (bgImg) memcpy(uiBuf + r * w, bgImg + (y + r) * W + x, w * 2);
+        else for (int i = 0; i < w; i++) uiBuf[r * w + i] = bg;
+    }
+    int tw = aaWidth(f, s);
+    int px = (align == AL_CENTER ? (w - shift - tw) / 2 : align == AL_RIGHT ? w - tw : 0) + shift;
+    int base = (h - uiTextH(f)) / 2 + f.ascent;
+    if (shadow) aaDraw(f, uiBuf, w, h, px + 1, base + 1, s.c_str(), 0x0000);
+    aaDraw(f, uiBuf, w, h, px, base, s.c_str(), fg);
+    tft.drawRGBBitmap(x, y, uiBuf, w, h);
+}
+
+// Text whose box is exactly as wide as the text; returns that width.
+int uiText(const AAFont &f, int x, int y, const String &s, uint16_t fg, uint16_t bg = UI_BG) {
+    int w = aaWidth(f, s) + 2;
+    uiBox(f, x, y, w, uiTextH(f), s, fg, bg);
+    return w;
+}
+
+// A horizontal bar with round ends: `frac` of it in `color`, the rest in `track`, outside the
+// round ends `bg`. Composed off-screen like text, so a level that updates often doesn't flicker.
+void uiBar(int x, int y, int w, int h, float frac, uint16_t color, uint16_t track = UI_LINE, uint16_t bg = UI_BG) {
+    if (!uiBuf || w * h > UI_BUF_PIXELS) return;
+    int fillW = constrain((int)lroundf(w * frac), 0, w);
+    float r = h / 2.0f;
+    for (int row = 0; row < h; row++) {
+        float dy = row + 0.5f - r;
+        int inset = (int)ceilf(r - sqrtf(max(0.0f, r * r - dy * dy)) - 0.5f);
+        for (int i = 0; i < w; i++) {
+            uint16_t c = i < fillW ? color : track;
+            if (i < inset || i >= w - inset) c = bg;
+            uiBuf[row * w + i] = c;
+        }
+    }
+    tft.drawRGBBitmap(x, y, uiBuf, w, h);
+}
+
+// Battery: the percentage, then a small battery (with a bolt while charging), its right edge at
+// `right`; "USB" when no battery is read. `bgImg` as in uiBox, for the clock's photo.
+void uiBattery(int right, int y, uint16_t bg = UI_BG, const uint16_t *bgImg = nullptr) {
     float v = batteryVolts();
-    tft.fillRect(x - 2, y - 2, W - x + 2, h + 4, ST77XX_BLACK); // clear the old indicator
+    const int iw = 21, ih = 11, ix = right - iw - 2, iy = y + 5;
     if (!batteryPresent(v)) {
-        tft.setTextColor(MUTED, ST77XX_BLACK);
-        tft.setTextSize(1);
-        tft.setCursor(x + 6, y + 4);
-        tft.print("USB");
+        uiBox(ui12, right - 60, y, 60, 20, "USB", UI_SUB, bg, AL_RIGHT, bgImg, bgImg != nullptr);
         return;
     }
     int pct = batteryPercent(v);
-    uint16_t color = pct > 50 ? ST77XX_GREEN : pct > 20 ? ST77XX_YELLOW : ST77XX_RED;
-    tft.drawRect(x, y, w, h, MUTED);
-    tft.fillRect(x + w, y + 4, 3, h - 8, MUTED); // the nub
-    tft.fillRect(x + 2, y + 2, (w - 4) * pct / 100, h - 4, color);
+    uiBox(ui12, ix - 46, y, 42, 20, String(pct) + "%", bgImg ? UI_TXT : UI_SUB, bg, AL_RIGHT, bgImg, bgImg != nullptr);
+    uint16_t frame = rgb565(170, 176, 188);
+    if (bgImg) {
+        for (int r = 0; r < 20; r++) tft.drawRGBBitmap(ix - 4, y + r, (uint16_t *)bgImg + (y + r) * W + ix - 4, iw + 8, 1);
+    } else {
+        tft.fillRect(ix - 4, y, iw + 8, 20, bg);
+    }
+    tft.drawRoundRect(ix, iy, iw, ih, 3, frame);
+    tft.fillRect(ix + iw, iy + 3, 2, ih - 6, frame);
+    uint16_t c = batteryCharging ? UI_GREEN : pct > 20 ? UI_GREEN : UI_RED;
+    int fw = max(1, (iw - 4) * pct / 100);
+    tft.fillRoundRect(ix + 2, iy + 2, fw, ih - 4, 1, c);
+    if (batteryCharging) { // a bolt over the bar
+        int cx = ix + iw / 2, cy = iy + ih / 2;
+        tft.fillTriangle(cx + 2, cy - 5, cx - 4, cy + 1, cx + 1, cy + 1, UI_TXT);
+        tft.fillTriangle(cx - 1, cy - 1, cx + 4, cy - 1, cx - 2, cy + 5, UI_TXT);
+    }
+}
+
+// Battery indicator in the title bar, so every screen that has one shows it.
+// Status bar, on every screen but the clock: the time on the left, the battery on the right.
+// It is redrawn only when one of them changes (uiStatusTick).
+int statusShownKey = -2;
+
+int statusKey() {
+    time_t now = time(nullptr);
+    int minute = now > 8 * 3600 ? (int)((now / 60) % 1440) : -1;
+    float v = batteryVolts();
+    int batt = batteryPresent(v) ? batteryPercent(v) + (batteryCharging ? 1000 : 0) : -1;
+    return minute * 4000 + batt;
+}
+
+void uiStatusBar() {
+    time_t now = time(nullptr);
+    String hhmm;
+    if (now > 8 * 3600) {
+        struct tm t;
+        localtime_r(&now, &t);
+        char buf[8];
+        strftime(buf, sizeof(buf), "%H:%M", &t);
+        hhmm = buf;
+    }
+    uiBox(ui13b, 14, 2, 70, 20, hhmm, UI_TXT, UI_BG);
+    uiBattery(W - 12, 2);
+    statusShownKey = statusKey();
 }
 
 void screenInit() {
@@ -219,9 +558,8 @@ void screenInit() {
     tft.init(W, H);
     tft.setRotation(0);
     tft.setTextWrap(false); // a long line must be clipped, never wrapped onto the layout below
-    u8f.begin(tft);
-    u8f.setFont(u8g2_font_unifont_t_vietnamese2);
-    u8f.setFontMode(1); // transparent: rows are cleared before drawing
+    if (!tft.mirror) tft.mirror = (uint16_t *)ps_calloc(W * H, 2);
+    if (!uiBuf) uiBuf = (uint16_t *)ps_malloc(UI_BUF_PIXELS * 2);
 }
 
 // The built-in font is ASCII only, so Vietnamese text from the phone (place names, file names)
@@ -260,23 +598,24 @@ String asciiFold(const String &in) {
 // Anything the phone sends is drawn by the phone, so it keeps its accents.
 // Title bar: the name on black, underlined by a short accent stroke, above a thin divider.
 // It spans y 0-26; screens draw their content from y 28.
+// One line of UI text at (x, y) (top-left, as with the built-in font). With `solid`, what was there
+// before is overwritten: by the glyph background in the built-in font (callers pad with spaces),
+// by clearing the strip first for the Unifont. Unifont text is clipped to the screen width.
+// (old built-in-font text helper removed: see uiBox / uiText above)
+
+// A screen's top: status bar, then the title in large type. Content starts at CONTENT_Y.
 void header(const char *title) {
-    tft.fillScreen(ST77XX_BLACK);
-    tft.setTextColor(ST77XX_WHITE);
-    tft.setTextSize(2);
-    tft.setCursor(10, 5);
-    tft.print(title);
-    tft.fillRect(10, 23, strlen(title) * 12 - 2, 2, ACCENT);
-    tft.drawFastHLine(0, 26, W, DIVIDER);
-    tft.setTextSize(1);
-    drawBatteryIcon();
+    tft.fillScreen(UI_BG);
+    uiStatusBar();
+    uiBox(ui20b, 14, 30, W - 28, uiTextH(ui20b), title, UI_TXT, UI_BG);
 }
 
-void line(int y, const String &text, uint16_t color = ST77XX_WHITE, uint8_t size = 2) {
-    tft.setTextColor(color, ST77XX_BLACK);
-    tft.setTextSize(size);
-    tft.setCursor(8, y);
-    tft.print(text);
+// A full-width line of text from the left margin (size 1 small, 2 body, 3 large), clearing
+// whatever was on that line before.
+const AAFont &uiFontForSize(uint8_t size) { return size <= 1 ? ui12 : size == 2 ? ui15 : ui20b; }
+void line(int y, const String &text, uint16_t color = UI_TXT, uint8_t size = 2) {
+    const AAFont &f = uiFontForSize(size);
+    uiBox(f, 14, y, W - 28, uiTextH(f), text, color, UI_BG);
 }
 
 bool showStoredPage(int i) {
@@ -340,6 +679,7 @@ DocInfo docCache[MAX_DOCS];
 int docCacheN = 0;
 bool readerInList = true;
 int readerAt = 0; // index into docCache
+int readerTop = 0; // first row on screen
 
 void refreshDocCache() {
     docCacheN = 0;
@@ -355,29 +695,48 @@ void readerSelectSlot(int slot) {
     }
 }
 
-void readerDrawRow(int i) { // one row: name plus page info, painted over the old text
-    if (i < 0 || i >= docCacheN) return;
+// A card per document: the name, and the page count with where reading stopped.
+const int DOC_ROW_H = 50, DOC_ROWS = 5;
+void readerDrawRow(int i) {
+    if (i < 0 || i >= docCacheN || i < readerTop || i >= readerTop + DOC_ROWS) return;
     const DocInfo &d = docCache[i];
     bool sel = i == readerAt;
-    String row = String(sel ? ">" : " ") + asciiFold(d.name);
-    if (row.length() > 19) row = row.substring(0, 19);
-    while (row.length() < 19) row += ' ';
-    line(40 + i * 28, row, sel ? ST77XX_YELLOW : ST77XX_WHITE, 2);
-    String sub = String(d.pages) + " pages" +
-        (d.slot == curDoc ? ", page " + String(currentPage + 1) : "");
-    while (sub.length() < 34) sub += ' ';
-    line(40 + i * 28 + 18, sub, ST77XX_CYAN, 1);
+    int y = CONTENT_Y + (i - readerTop) * DOC_ROW_H;
+    uint16_t bg = sel ? UI_CARD_SEL : UI_BG;
+    tft.fillRoundRect(8, y, 224, DOC_ROW_H - 4, 12, bg);
+    uiBox(sel ? ui15b : ui15, 20, y + 3, 196, 22, d.name, sel ? UI_TXT : UI_TXT2, bg);
+    String sub = String(d.pages) + T(" pages", " trang") +
+        (d.slot == curDoc ? String(T(" · on page ", " · đang ở trang ")) + (currentPage + 1) : String());
+    uiBox(ui12, 20, y + 25, 196, 18, sub, UI_SUB, bg);
+}
+
+void readerMove(int dir) {
+    if (docCacheN == 0) return;
+    int previous = readerAt;
+    readerAt = (readerAt + dir + docCacheN) % docCacheN;
+    int top = readerTop;
+    if (readerAt < top) top = readerAt;
+    if (readerAt >= top + DOC_ROWS) top = readerAt - DOC_ROWS + 1;
+    if (top != readerTop) {
+        readerTop = top;
+        tft.fillRect(0, CONTENT_Y, W, DOC_ROWS * DOC_ROW_H, UI_BG);
+        for (int k = readerTop; k < readerTop + DOC_ROWS; k++) readerDrawRow(k);
+    } else { // only the two rows that changed, so scrolling stays instant
+        readerDrawRow(previous);
+        readerDrawRow(readerAt);
+    }
 }
 
 void readerDrawList() {
-    header("Documents");
+    header(T("Documents", "Tài liệu"));
     refreshDocCache();
     if (docCacheN == 0) {
-        line(50, "No documents");
-        line(80, "http://" + WiFi.localIP().toString() + "/", ST77XX_YELLOW, 1);
+        line(CONTENT_Y, T("No documents", "Chưa có tài liệu"), UI_SUB);
+        line(CONTENT_Y + 26, "http://" + WiFi.localIP().toString() + "/", ACCENT, 1);
         return;
     }
-    for (int i = 0; i < docCacheN; i++) readerDrawRow(i);
+    if (readerAt < readerTop || readerAt >= readerTop + DOC_ROWS) readerTop = max(0, readerAt - DOC_ROWS + 1);
+    for (int i = readerTop; i < readerTop + DOC_ROWS; i++) readerDrawRow(i);
 }
 
 void readerEnter() {
@@ -394,9 +753,10 @@ void readerPress() {
 }
 
 void receiveEnter() {
-    header("From phone");
-    line(60, "http://" + WiFi.localIP().toString() + "/", ST77XX_YELLOW);
-    line(92, "http://esp32.local/", ST77XX_YELLOW, 1);
+    header(T("From phone", "Từ điện thoại"));
+    tft.fillRoundRect(8, CONTENT_Y, 224, 72, 14, UI_CARD);
+    uiBox(ui15b, 22, CONTENT_Y + 12, 196, 24, "http://" + WiFi.localIP().toString() + "/", ACCENT, UI_CARD);
+    uiBox(ui13b, 22, CONTENT_Y + 38, 196, 22, "http://esp32.local/", UI_TXT2, UI_CARD);
 }
 
 int lastClockMinute = -1;
@@ -425,7 +785,7 @@ void clockBgRestore(int y, int h) {
     if (y >= H) return;
     h = min(h, H - y);
     if (!clockBg) {
-        tft.fillRect(0, y, W, h, ST77XX_BLACK);
+        tft.fillRect(0, y, W, h, UI_BG);
         return;
     }
     tft.drawRGBBitmap(0, y, clockBg + y * W, W, h);
@@ -434,84 +794,67 @@ void clockBgRestore(int y, int h) {
 // A centred line of the clock screen. On black it is padded to `cells` characters and drawn with
 // a solid background, so it overwrites the previous text without a clear (no flicker). On a
 // photo it repaints its strip of the photo first, then draws the text over a dark shadow.
-void clockLine(int y, const String &text, uint16_t color, uint8_t size, int cells) {
-    tft.setTextSize(size);
-    String t = text;
-    if (!clockBg) {
-        int pad = max(0, cells - (int)t.length());
-        String left;
-        for (int i = 0; i < pad / 2; i++) left += ' ';
-        t = left + t;
-        while ((int)t.length() < cells) t += ' ';
-        tft.setTextColor(color, ST77XX_BLACK);
-        tft.setCursor((W - (int)t.length() * 6 * size + size) / 2, y);
-        tft.print(t);
-        return;
-    }
-    clockBgRestore(y, 8 * size);
-    int x = (W - (int)t.length() * 6 * size + size) / 2;
-    int o = size >= 4 ? 2 : 1;
-    tft.setTextColor(ST77XX_BLACK);
-    tft.setCursor(x + o, y + o);
-    tft.print(t);
-    tft.setTextColor(color);
-    tft.setCursor(x, y);
-    tft.print(t);
+// A centred, full-width line of the clock screen, over black or over the photo (with a shadow).
+void clockText(const AAFont &f, int y, const String &text, uint16_t color) {
+    uiBox(f, 0, y, W, uiTextH(f), text, color, UI_BG, AL_CENTER, clockBg, clockBg != nullptr);
 }
 
-// Home screen: no title bar and no status lines, just the time, with the weekday above and the
-// date below, centred on black or on the photo from the phone.
-const int CLOCK_DAY_Y = 72, CLOCK_TIME_Y = 108, CLOCK_DATE_Y = 188, CLOCK_TIMER_Y = 250;
+// Home screen: no title bar and no status lines, just the date and a large time, centred on
+// black or on the photo from the phone; the battery sits in the top-right corner.
+const int CLOCK_DATE_Y = 90, CLOCK_TIME_Y = 112, CLOCK_TIMER_Y = 262;
 
 // HH:MM at text size 8. The font's colon sits in a full-width cell and leaves wide gaps, so the
 // two digit pairs are printed separately around a colon drawn as two squares.
-void clockTime(const char *hhmm) {
-    const int size = 8, pairW = 2 * 6 * size - size, gap = 10, dot = size;
-    const int x0 = (W - (2 * pairW + 2 * gap + dot)) / 2, x1 = x0 + pairW + gap + dot + gap, cx = x0 + pairW + gap;
-    const int y = CLOCK_TIME_Y;
-    String hh = String(hhmm).substring(0, 2), mm = String(hhmm).substring(3, 5);
-    tft.setTextSize(size);
-    auto draw = [&](int o, uint16_t color, bool solid) {
-        if (solid) tft.setTextColor(color, ST77XX_BLACK);
-        else tft.setTextColor(color);
-        tft.setCursor(x0 + o, y + o);
-        tft.print(hh);
-        tft.setCursor(x1 + o, y + o);
-        tft.print(mm);
-        tft.fillRect(cx + o, y + 2 * size + o, dot, dot, color);
-        tft.fillRect(cx + o, y + 5 * size + o, dot, dot, color);
-    };
-    if (!clockBg) {
-        draw(0, ST77XX_WHITE, true);
-        return;
-    }
-    clockBgRestore(y, 8 * size);
-    draw(2, ST77XX_BLACK, false); // shadow
-    draw(0, ST77XX_WHITE, false);
+void clockTime(const char *hhmm) { clockText(num68, CLOCK_TIME_Y, hhmm, UI_TXT); }
+
+// Battery in the top-right corner of the home screen: percent and a small battery, with a bolt
+// while charging, or "USB". Redrawn only when what it shows changes.
+int homeBatteryShown = -2; // pct, or -1 for USB; +1000 while charging; -2 = must redraw
+
+void homeBatteryDraw(bool force = false) {
+    float v = batteryVolts();
+    bool present = batteryPresent(v);
+    int key = present ? batteryPercent(v) + (batteryCharging ? 1000 : 0) : -1;
+    if (!force && key == homeBatteryShown) return;
+    homeBatteryShown = key;
+    uiBattery(W - 12, 6, UI_BG, clockBg);
 }
 
 void clockEnter() {
     lastClockMinute = -1;
     clockBgRestore(0, H);
-    clockLine(150, "Waiting for time", tft.color565(150, 150, 150), 1, 16);
+    homeBatteryDraw(true);
+    clockText(ui12, 150, T("Waiting for time", "Đang lấy giờ"), UI_SUB);
 }
 
 void clockTick() {
+    static unsigned long lastBatteryCheckMs = 0;
+    if (millis() - lastBatteryCheckMs > 2000) {
+        lastBatteryCheckMs = millis();
+        homeBatteryDraw();
+    }
     time_t now = time(nullptr);
     if (now < 8 * 3600) return; // NTP has not answered yet
     struct tm t;
     localtime_r(&now, &t);
     if (t.tm_min == lastClockMinute) return;
-    if (lastClockMinute < 0) clockBgRestore(0, H); // clears the "waiting for time" note
+    if (lastClockMinute < 0) { // clears the "waiting for time" note
+        clockBgRestore(0, H);
+        homeBatteryDraw(true);
+    }
     lastClockMinute = t.tm_min;
 
     static const char *DAYS[] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
-    char buf[32];
-    clockLine(CLOCK_DAY_Y, DAYS[t.tm_wday], ACCENT, 2, 9);
+    static const char *DAYS_VI[] = {"Chủ Nhật", "Thứ Hai", "Thứ Ba", "Thứ Tư", "Thứ Năm", "Thứ Sáu", "Thứ Bảy"};
+    static const char *MONTHS[] = {"January", "February", "March", "April", "May", "June", "July",
+                                   "August", "September", "October", "November", "December"};
+    String date = uiLang == LANG_VI
+        ? String(DAYS_VI[t.tm_wday]) + ", " + t.tm_mday + " tháng " + (t.tm_mon + 1)
+        : String(DAYS[t.tm_wday]) + ", " + t.tm_mday + " " + MONTHS[t.tm_mon];
+    clockText(ui15, CLOCK_DATE_Y, date, UI_SUB);
+    char buf[8];
     strftime(buf, sizeof(buf), "%H:%M", &t);
     clockTime(buf);
-    strftime(buf, sizeof(buf), "%d/%m/%Y", &t);
-    clockLine(CLOCK_DATE_Y, buf, tft.color565(200, 200, 200), 2, 10);
 }
 
 const char *AP_SSID = "ESP32-Device";
@@ -545,15 +888,22 @@ void apStop() {
 }
 
 int lastApClients = -1;
+// A switch like a phone's settings: a pill with a knob, green when on.
+void uiSwitch(int x, int y, bool on, uint16_t bg) {
+    tft.fillRoundRect(x, y, 44, 26, 13, on ? UI_GREEN : UI_LINE);
+    tft.fillCircle(on ? x + 31 : x + 13, y + 13, 10, UI_TXT);
+}
+
 void hotspotDraw() {
-    header("Hotspot");
+    header(T("Hotspot", "Phát WiFi"));
     lastApClients = -1;
+    tft.fillRoundRect(8, CONTENT_Y, 224, apOn ? 104 : 64, 14, UI_CARD);
+    uiBox(ui15b, 22, CONTENT_Y + 10, 140, 22, AP_SSID, UI_TXT, UI_CARD);
+    uiBox(ui12, 22, CONTENT_Y + 32, 140, 18, apOn ? T("No password", "Không mật khẩu") : T("Off", "Đang tắt"), UI_SUB, UI_CARD);
+    uiSwitch(176, CONTENT_Y + 19, apOn, UI_CARD);
     if (apOn) {
-        line(50, AP_SSID, ST77XX_WHITE, 2);
-        line(82, "no password", ST77XX_WHITE, 1);
-        line(110, "http://192.168.4.1/", ST77XX_YELLOW, 2);
-    } else {
-        line(50, "Off", ST77XX_WHITE, 2);
+        tft.drawFastHLine(22, CONTENT_Y + 60, 196, UI_LINE);
+        uiBox(ui13b, 22, CONTENT_Y + 70, 196, 22, "http://192.168.4.1", ACCENT, UI_CARD);
     }
 }
 void hotspotEnter() { hotspotDraw(); }
@@ -562,7 +912,7 @@ void hotspotTick() {
     int clients = WiFi.softAPgetStationNum();
     if (clients == lastApClients) return;
     lastApClients = clients;
-    line(160, "Clients: " + String(clients) + "  ", ST77XX_WHITE, 2);
+    line(CONTENT_Y + 118, T("Connected devices: ", "Thiết bị đang kết nối: ") + String(clients), UI_SUB, 1);
 }
 void hotspotPress() {
     apOn ? apStop() : apStart();
@@ -572,29 +922,35 @@ void hotspotPress() {
 
 int radarState = 0; // 0 = scanning, 1 = done
 void radarEnter() {
-    header("WiFi scan");
-    line(50, "Scanning...");
+    header(T("WiFi scan", "Quét WiFi"));
+    line(CONTENT_Y, T("Scanning...", "Đang quét..."), UI_SUB);
     WiFi.scanDelete();
     WiFi.scanNetworks(true);
     radarState = 0;
+}
+
+void uiSignalBars(int x, int y, int rssi) { // four bars, bottom-aligned, the ones reached lit
+    int level = rssi >= -55 ? 4 : rssi >= -67 ? 3 : rssi >= -78 ? 2 : 1;
+    uint16_t c = level >= 3 ? UI_GREEN : level == 2 ? UI_YELLOW : UI_RED;
+    for (int i = 0; i < 4; i++) {
+        int h = 4 + i * 3;
+        tft.fillRoundRect(x + i * 5, y + 13 - h, 3, h, 1, i < level ? c : UI_LINE);
+    }
 }
 void radarTick() {
     if (radarState) return;
     int n = WiFi.scanComplete();
     if (n < 0) return;
-    header("WiFi scan");
-    int y = 34;
-    for (int i = 0; i < n && i < 9; i++) {
-        String ssid = WiFi.SSID(i);
-        if (ssid.length() > 17) ssid = ssid.substring(0, 17);
-        int rssi = WiFi.RSSI(i);
-        uint16_t c = rssi >= -60 ? ST77XX_GREEN : rssi >= -75 ? ST77XX_YELLOW : ST77XX_RED;
-        line(y, ssid, c, 1);
-        tft.setCursor(190, y);
-        tft.print(rssi);
-        y += 14;
+    header(T("WiFi scan", "Quét WiFi"));
+    const int rowH = 26;
+    int shown = min(n, 9);
+    for (int i = 0; i < shown; i++) {
+        int y = CONTENT_Y + i * rowH;
+        uiBox(ui15, 14, y + 2, 150, 22, WiFi.SSID(i), UI_TXT, UI_BG);
+        uiBox(ui12, 164, y + 2, 40, 22, String(WiFi.RSSI(i)), UI_SUB, UI_BG, AL_RIGHT);
+        uiSignalBars(210, y + 5, WiFi.RSSI(i));
     }
-    line(y + 10, String(n) + " networks", ST77XX_WHITE, 1);
+    line(CONTENT_Y + shown * rowH + 4, String(n) + T(" networks", " mạng"), UI_SUB, 1);
     WiFi.scanDelete();
     radarState = 1;
 }
@@ -607,39 +963,63 @@ struct Preset {
 const Preset PRESETS[] = {{"Off", 0, 0, 0}, {"Red", 255, 0, 0}, {"Orange", 255, 64, 0}, {"Yellow", 255, 176, 0},
     {"Green", 0, 255, 0}, {"Cyan", 0, 255, 255}, {"Blue", 0, 0, 255}, {"Purple", 128, 0, 255},
     {"Pink", 255, 0, 96}, {"White", 255, 255, 255}};
+const char *PRESET_NAMES_VI[] = {"Tắt", "Đỏ", "Cam", "Vàng", "Xanh lá", "Xanh lơ", "Xanh dương", "Tím", "Hồng", "Trắng"};
 int presetIndex = 0;
-void ledShow() {
+void ledShow() { // the swatch, the name and a dot per preset; the header stays
     const Preset &p = PRESETS[presetIndex];
     setLed(p.r, p.g, p.b);
-    header("RGB light");
-    line(60, String(p.name) + "        ", ST77XX_WHITE, 3);
-    tft.fillRect(40, 120, 160, 80, tft.color565(p.r, p.g, p.b));
+    const int sy = CONTENT_Y + 14;
+    tft.fillRect(0, sy, W, 200, UI_BG);
+    if (presetIndex == 0) tft.drawRoundRect(48, sy, 144, 120, 24, UI_LINE);
+    else tft.fillRoundRect(48, sy, 144, 120, 24, tft.color565(p.r, p.g, p.b));
+    uiBox(ui20b, 0, sy + 140, W, uiTextH(ui20b), T(p.name, PRESET_NAMES_VI[presetIndex]), UI_TXT, UI_BG, AL_CENTER);
+    int count = sizeof(PRESETS) / sizeof(PRESETS[0]);
+    int x0 = (W - (count - 1) * 14) / 2;
+    for (int i = 0; i < count; i++) tft.fillCircle(x0 + i * 14, sy + 196, 3, i == presetIndex ? UI_TXT : UI_LINE);
 }
-void ledEnter() { ledShow(); }
+void ledEnter() {
+    header(T("RGB light", "Đèn RGB"));
+    ledShow();
+}
 void ledPress() {
     presetIndex = (presetIndex + 1) % (int)(sizeof(PRESETS) / sizeof(PRESETS[0]));
     ledShow();
+}
+
+// Label on the left, value on the right; labels once, values every second.
+const int INFO_ROW_H = 24;
+void infoRow(int i, const String &label, const String &value, bool withLabel) {
+    int y = CONTENT_Y + i * INFO_ROW_H;
+    if (withLabel) uiBox(ui12, 14, y, 100, INFO_ROW_H, label, UI_SUB, UI_BG);
+    uiBox(ui13b, 100, y, W - 114, INFO_ROW_H, value, UI_TXT, UI_BG, AL_RIGHT);
+}
+
+void infoRows(bool withLabels) {
+    float v = batteryVolts();
+    String batt = batteryPresent(v) ? String(batteryPercent(v)) + "% · " + String(v, 2) + "V" + (batteryCharging ? T(" · charging", " · đang sạc") : "")
+                                    : String(T("USB power", "Nguồn USB"));
+    int i = 0;
+    infoRow(i++, "WiFi", WiFi.status() == WL_CONNECTED ? String(WIFI_SSID) : String(T("not connected", "chưa kết nối")), withLabels);
+    infoRow(i++, "IP", WiFi.localIP().toString(), withLabels);
+    infoRow(i++, T("Signal", "Sóng"), String((int)WiFi.RSSI()) + " dBm", withLabels);
+    infoRow(i++, T("Uptime", "Đã chạy"), String(millis() / 60000) + T(" min", " phút"), withLabels);
+    infoRow(i++, T("Free RAM", "RAM trống"), String(ESP.getFreeHeap() / 1024) + " KB", withLabels);
+    infoRow(i++, "PSRAM", String(ESP.getFreePsram() / 1024) + " KB", withLabels);
+    infoRow(i++, T("Storage", "Bộ nhớ trống"), String(FFat.freeBytes() / 1048576) + " MB", withLabels);
+    infoRow(i++, T("Chip temp", "Nhiệt độ chip"), String(temperatureRead(), 1) + " °C", withLabels);
+    infoRow(i++, T("Battery", "Pin"), batt, withLabels);
 }
 
 void infoTick() {
     static unsigned long last = 0;
     if (millis() - last < 1000) return;
     last = millis();
-    int y = 40;
-    line(y, "WiFi: " + String(WiFi.status() == WL_CONNECTED ? WIFI_SSID : "not connected") + "    ", ST77XX_WHITE, 1);
-    line(y += 16, "IP:   " + WiFi.localIP().toString() + "     ", ST77XX_WHITE, 1);
-    line(y += 16, "Signal: " + String((int)WiFi.RSSI()) + " dBm   ", ST77XX_WHITE, 1);
-    line(y += 16, "Uptime: " + String(millis() / 60000) + " min   ", ST77XX_WHITE, 1);
-    line(y += 16, "Free RAM: " + String(ESP.getFreeHeap() / 1024) + " KB   ", ST77XX_WHITE, 1);
-    line(y += 16, "PSRAM:     " + String(ESP.getFreePsram() / 1024) + " KB   ", ST77XX_WHITE, 1);
-    line(y += 16, "Storage free: " + String(FFat.freeBytes() / 1048576) + " MB   ", ST77XX_WHITE, 1);
-    line(y += 16, "Pages: " + String(pageCount) + "    ", ST77XX_WHITE, 1);
-    line(y += 16, "Chip temp: " + String(temperatureRead(), 1) + " C  ", ST77XX_WHITE, 1);
-    float v = batteryVolts();
-    line(y += 16, batteryPresent(v) ? "Battery: " + String(batteryPercent(v)) + "% (" + String(v, 2) + "V)  "
-                                    : String("Battery: USB power"), ST77XX_WHITE, 1);
+    infoRows(false);
 }
-void infoEnter() { header("Info"); }
+void infoEnter() {
+    header(T("Info", "Thông tin"));
+    infoRows(true);
+}
 
 // ---------- microphone ----------
 // INMP441 I2S microphone: SCK=GPIO15, WS=GPIO16, SD=GPIO17, L/R to GND (left slot).
@@ -754,63 +1134,54 @@ void micBegin() {
 
 // Sound meter screen: big level, a bar, the loudest level since opening, and a sweeping graph.
 const int MIC_DB_LO = 30, MIC_DB_HI = 100;
-const int GRAPH_X = 8, GRAPH_W = 224, GRAPH_TOP = 176, GRAPH_H = 136;
+const int GRAPH_X = 14, GRAPH_W = 212, GRAPH_TOP = 150, GRAPH_H = 156;
 int micGraphX = 0;
 float micMax = 0;
 
 uint16_t micColor(float db) {
-    return db < 60 ? ST77XX_GREEN : db < 80 ? ST77XX_YELLOW : ST77XX_RED;
+    return db < 60 ? UI_GREEN : db < 80 ? UI_YELLOW : UI_RED;
 }
 int micScale(float db, int span) {
     return constrain((int)((db - MIC_DB_LO) * span / (MIC_DB_HI - MIC_DB_LO)), 0, span);
 }
 void micEnter() {
-    header("Sound meter");
+    header(T("Sound meter", "Đo âm thanh"));
     micGraphX = 0;
     micMax = 0;
-    tft.drawFastHLine(GRAPH_X, GRAPH_TOP - 4, GRAPH_W, tft.color565(60, 60, 60));
+    uiText(ui15, 86, CONTENT_Y + 12, "dB", UI_SUB);
+    uiText(ui12, 156, CONTENT_Y, T("Max", "Tối đa"), UI_SUB);
+    for (int g = 60; g <= 80; g += 20) { // faint guide lines at 60 and 80 dB
+        int gy = GRAPH_TOP + GRAPH_H - micScale(g, GRAPH_H);
+        for (int x = GRAPH_X; x < GRAPH_X + GRAPH_W; x += 4) tft.drawPixel(x, gy, UI_LINE);
+    }
 }
 void micTick() {
     static unsigned long last = 0;
     if (millis() - last < 100) return;
     last = millis();
     if (!micReady) {
-        line(60, "No microphone", ST77XX_RED, 2);
+        line(CONTENT_Y, T("No microphone", "Không có micro"), UI_RED);
         return;
     }
     float db = micDb;
     micMax = max(micMax, db);
     uint16_t c = micColor(db);
-
-    char num[8];
-    snprintf(num, sizeof(num), "%3d", (int)lroundf(db));
-    tft.setTextColor(c, ST77XX_BLACK);
-    tft.setTextSize(6);
-    tft.setCursor(24, 40);
-    tft.print(num);
-    tft.setTextSize(3);
-    tft.setCursor(140, 61);
-    tft.print("dB");
-
-    int w = micScale(db, 224);
-    tft.fillRect(8, 100, w, 20, c);
-    tft.fillRect(8 + w, 100, 224 - w, 20, tft.color565(40, 40, 40));
-
-    line(134, "Max " + String((int)lroundf(micMax)) + " dB   ", micColor(micMax), 2);
+    uiBox(num34, 14, CONTENT_Y - 2, 68, 40, String((int)lroundf(db)), c, UI_BG, AL_RIGHT);
+    uiBox(ui15b, 156, CONTENT_Y + 18, 70, 22, String((int)lroundf(micMax)) + " dB", micColor(micMax), UI_BG);
+    uiBar(14, CONTENT_Y + 52, 212, 10, micScale(db, 1000) / 1000.0f, c);
 
     // Sweep the graph like an oscilloscope: one column per update, a blank column ahead of it
     // marks where the trace is, and nothing is ever cleared wholesale.
     int x = GRAPH_X + micGraphX;
     int h = micScale(db, GRAPH_H);
-    tft.drawFastVLine(x, GRAPH_TOP, GRAPH_H - h, ST77XX_BLACK);
+    tft.drawFastVLine(x, GRAPH_TOP, GRAPH_H - h, UI_BG);
     tft.drawFastVLine(x, GRAPH_TOP + GRAPH_H - h, h, c);
-    uint16_t grid = tft.color565(70, 70, 70);
     for (int g = 60; g <= 80; g += 20) {
         int gy = GRAPH_TOP + GRAPH_H - micScale(g, GRAPH_H);
-        if (gy < GRAPH_TOP + GRAPH_H - h) tft.drawPixel(x, gy, grid);
+        if (gy < GRAPH_TOP + GRAPH_H - h && x % 4 == GRAPH_X % 4) tft.drawPixel(x, gy, UI_LINE);
     }
     micGraphX = (micGraphX + 1) % GRAPH_W;
-    tft.drawFastVLine(GRAPH_X + micGraphX, GRAPH_TOP, GRAPH_H, ST77XX_BLACK);
+    tft.drawFastVLine(GRAPH_X + micGraphX, GRAPH_TOP, GRAPH_H, UI_BG);
 }
 void micPress() { micEnter(); } // knob press: reset the max and the graph
 
@@ -962,42 +1333,39 @@ String mmss(uint32_t sec) {
     return t;
 }
 
+const int REC_CY = 132;
+void recDot(bool on) {
+    tft.fillCircle(120, REC_CY, 40, on ? UI_RED : rgb565(70, 20, 20));
+}
 void recDraw() {
-    tft.fillRect(0, 28, W, H - 28, ST77XX_BLACK);
-    tft.fillCircle(120, 90, 38, recording ? ST77XX_RED : tft.color565(150, 0, 0));
-    tft.drawCircle(120, 90, 45, ST77XX_WHITE);
-    tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
-    tft.setTextSize(5);
-    tft.setCursor(45, 160);
-    tft.print(mmss(recording ? (millis() - recStartMs) / 1000 : 0));
+    tft.fillRect(0, CONTENT_Y, W, H - CONTENT_Y, UI_BG);
+    tft.drawCircle(120, REC_CY, 48, UI_LINE);
+    tft.drawCircle(120, REC_CY, 49, UI_LINE);
+    recDot(recording);
+    uiBox(num34, 0, 188, W, 40, mmss(recording ? (millis() - recStartMs) / 1000 : 0), UI_TXT, UI_BG, AL_CENTER);
     if (recording) {
-        line(260, "Recording", ST77XX_RED, 2);
+        uiBox(ui15, 0, 230, W, 24, T("Recording", "Đang ghi"), UI_RED, UI_BG, AL_CENTER);
     } else if (recLastSaved.length()) {
-        line(250, "Saved", ST77XX_GREEN, 2);
-        line(272, recLastSaved, ST77XX_WHITE, 1);
+        uiBox(ui15, 0, 230, W, 24, T("Saved", "Đã lưu"), UI_GREEN, UI_BG, AL_CENTER);
+        uiBox(ui12, 0, 254, W, 18, recLastSaved, UI_SUB, UI_BG, AL_CENTER);
     } else {
-        line(260, "Ready", ST77XX_WHITE, 2);
+        uiBox(ui15, 0, 230, W, 24, T("Ready", "Sẵn sàng"), UI_SUB, UI_BG, AL_CENTER);
     }
-    line(300, String(recFileCount()) + " files  " + mmss(FFat.freeBytes() / (MIC_RATE * 2)) + " free", tft.color565(150, 150, 150), 1);
+    uiBox(ui12, 0, 296, W, 18, String(recFileCount()) + T(" files · ", " tệp · ") + mmss(FFat.freeBytes() / (MIC_RATE * 2)) + T(" free", " trống"),
+          UI_SUB, UI_BG, AL_CENTER);
 }
 void recEnter() {
-    header("Recorder");
+    header(T("Recorder", "Ghi âm"));
     recDraw();
 }
 void recTick() {
     static unsigned long last = 0;
     if (!recording || millis() - last < 200) return;
     last = millis();
-    bool on = (millis() - recStartMs) % 1000 < 600; // blinking dot while recording
-    tft.fillCircle(120, 90, 38, on ? ST77XX_RED : tft.color565(60, 0, 0));
-    tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
-    tft.setTextSize(5);
-    tft.setCursor(45, 160);
-    tft.print(mmss((millis() - recStartMs) / 1000));
+    recDot((millis() - recStartMs) % 1000 < 600); // blinking while recording
+    uiBox(num34, 0, 188, W, 40, mmss((millis() - recStartMs) / 1000), UI_TXT, UI_BG, AL_CENTER);
     float db = micDb;
-    int w = micScale(db, 224);
-    tft.fillRect(8, 222, w, 14, micColor(db));
-    tft.fillRect(8 + w, 222, 224 - w, 14, tft.color565(40, 40, 40));
+    uiBar(40, 274, 160, 8, micScale(db, 1000) / 1000.0f, micColor(db));
 }
 void recPress() {
     if (recording) recStop();
@@ -1010,7 +1378,12 @@ void recPress() {
 // it directly and replies with what it heard and an answer. The answer is drawn in a Unifont
 // with Vietnamese glyphs (the built-in font has none) and scrolls with the knob. The request
 // runs in its own task so the screen and buttons stay live while waiting.
-const char *ASK_PATH = "/ask.wav";
+// Consecutive questions alternate between two files, so a cancelled request that is still
+// uploading its recording never reads the file the next question is being recorded into.
+const char *ASK_PATHS[2] = {"/ask0.wav", "/ask1.wav"};
+uint8_t askSlot = 0;          // which of the two the current recording uses
+volatile uint32_t askJobId = 0; // bumped by every send and every cancel; replies to older ids are dropped
+bool askWasCancelled = false;
 const uint32_t ASK_MAX_S = 60;
 const char *ASK_DEFAULT_MODEL = "gemini-3.8-flash";
 const char *ASK_FALLBACK_MODEL = "gemini-flash-lite-latest"; // tried when the main one is overloaded
@@ -1025,13 +1398,15 @@ volatile AskState askState = AskState::Idle;
 String askQuestion, askAnswer, askError;
 unsigned long askSentMs = 0, askTookMs = 0;
 
-// Feeds HTTPClient the request body without holding it in RAM: a JSON prefix, the WAV file
-// base64-encoded on the fly, then a JSON suffix.
-class Base64FileBody : public Stream {
+// Feeds HTTPClient the request body without holding it in RAM: a prefix, the WAV file (base64-
+// encoded on the fly for JSON, or as-is for a multipart upload), then a suffix.
+class FileBody : public Stream {
 public:
-    Base64FileBody(const String &prefix, File file, const String &suffix) : _prefix(prefix), _file(file), _suffix(suffix) {}
+    FileBody(const String &prefix, File file, const String &suffix, bool base64 = true)
+        : _prefix(prefix), _suffix(suffix), _file(file), _base64(base64) {}
     static size_t base64Length(size_t raw) { return 4 * ((raw + 2) / 3); }
-    size_t total() const { return _prefix.length() + base64Length(_file.size()) + _suffix.length(); }
+    size_t fileLength() const { return _base64 ? base64Length(_file.size()) : _file.size(); }
+    size_t total() const { return _prefix.length() + fileLength() + _suffix.length(); }
     int available() override { return total() - _sent; }
     int read() override {
         uint8_t c;
@@ -1053,13 +1428,17 @@ public:
                 done += n;
                 _b64Pos += n;
                 _sent += n;
+            } else if (!_base64 && _file.available()) {
+                size_t n = _file.read(out + done, len - done);
+                done += n;
+                _sent += n;
             } else if (_file.available()) {
                 uint8_t raw[300]; // a multiple of 3, so no padding appears mid-stream
                 size_t n = _file.read(raw, sizeof(raw));
                 _b64Pos = 0;
                 mbedtls_base64_encode(_b64, sizeof(_b64), &_b64Len, raw, n);
             } else {
-                size_t at = _sent - _prefix.length() - base64Length(_file.size());
+                size_t at = _sent - _prefix.length() - fileLength();
                 if (at >= _suffix.length()) break;
                 size_t n = min(len - done, _suffix.length() - at);
                 memcpy(out + done, _suffix.c_str() + at, n);
@@ -1074,22 +1453,82 @@ public:
 private:
     String _prefix, _suffix;
     File _file;
+    bool _base64;
     size_t _sent = 0, _b64Len = 0, _b64Pos = 0;
     uint8_t _b64[404];
 };
 
-String askKey() {
-    prefs.begin("gemini", true);
+// Two providers: Gemini hears the WAV itself; Groq turns it into text with Whisper and then a
+// chat model answers. Each keeps its own key and model in its own NVS namespace, and "ask" holds
+// which one is in use. A request reads these into askJob first, in the loop task, because the
+// shared Preferences object must not be used from the request task.
+enum AskProvider : uint8_t { ASK_GEMINI, ASK_GROQ, ASK_PROVIDER_COUNT };
+const char *ASK_PROVIDER_IDS[] = {"gemini", "groq"};
+const char *ASK_PROVIDER_NAMES[] = {"Gemini", "Groq"};
+const char *GROQ_DEFAULT_MODEL = "openai/gpt-oss-120b";
+const char *GROQ_FALLBACK_MODEL = "qwen/qwen3.8-27b";
+const char *GROQ_STT_MODEL = "whisper-large-v3-turbo";
+const char *GROQ_STT_FALLBACK = "whisper-large-v3";
+const char *ASK_TEXT_SYSTEM =
+    "Bạn là trợ lý trên một thiết bị nhỏ có màn hình 240x320. Câu hỏi của người dùng được chuyển từ giọng nói "
+    "thành chữ nên có thể sai chính tả, hãy hiểu theo ý gần nhất. Trả lời bằng tiếng Việt có dấu, ngắn gọn "
+    "(không quá khoảng 120 từ), văn bản thuần, không dùng markdown. Nếu người dùng hỏi bằng ngôn ngữ khác thì "
+    "trả lời bằng ngôn ngữ đó.";
+
+AskProvider askProvider() {
+    prefs.begin("ask", true);
+    String id = prefs.getString("provider", "gemini");
+    prefs.end();
+    return id == "groq" ? ASK_GROQ : ASK_GEMINI;
+}
+void askSetProvider(AskProvider p) {
+    prefs.begin("ask", false);
+    prefs.putString("provider", ASK_PROVIDER_IDS[p]);
+    prefs.end();
+}
+String askKey(AskProvider p) {
+    prefs.begin(ASK_PROVIDER_IDS[p], true);
     String k = prefs.getString("key", "");
     prefs.end();
     return k;
 }
-String askModel() {
-    prefs.begin("gemini", true);
-    String m = prefs.getString("model", ASK_DEFAULT_MODEL);
+String askModel(AskProvider p) {
+    const char *def = p == ASK_GROQ ? GROQ_DEFAULT_MODEL : ASK_DEFAULT_MODEL;
+    prefs.begin(ASK_PROVIDER_IDS[p], true);
+    String m = prefs.getString("model", def);
     prefs.end();
-    return m.length() ? m : String(ASK_DEFAULT_MODEL);
+    return m.length() ? m : String(def);
 }
+String askKey() { return askKey(askProvider()); }
+
+// Everything a request needs, copied for its task: a cancelled request may still be running
+// when the next one starts.
+struct AskJob {
+    AskProvider provider;
+    String key, model;
+    const char *path;
+    uint32_t id;
+    uint8_t lang; // screen language: the answer and the transcription use it
+};
+
+// The instructions for the model, in the screen language. `fromAudio`: Gemini gets the recording
+// and must also write down what it heard; Groq gets Whisper's text.
+String askSystemPrompt(bool fromAudio, uint8_t lang) {
+    if (lang == LANG_VI) return fromAudio ? String(ASK_SYSTEM) : String(ASK_TEXT_SYSTEM);
+    return fromAudio
+        ? "You are a voice assistant on a small device with a 240x320 screen. The user asks by voice in the "
+          "recording. Write down exactly what the user said in the question field, then answer in the answer "
+          "field in English, briefly (about 120 words at most), plain text, no markdown. If the user speaks "
+          "another language, answer in that language. If you cannot hear clearly, say so in answer."
+        : "You are an assistant on a small device with a 240x320 screen. The question was transcribed from "
+          "speech and may contain mistakes; go with the closest meaning. Answer in English, briefly (about "
+          "120 words at most), plain text, no markdown. If the user speaks another language, answer in that language.";
+}
+struct AskResult {
+    bool ok = false;
+    String question, answer, error;
+    void fail(const String &why) { error = why; }
+};
 
 void askFail(const String &why) {
     askError = why;
@@ -1097,75 +1536,154 @@ void askFail(const String &why) {
     Serial.println("Ask failed: " + why);
 }
 
-// One generateContent call with the recorded question. Returns the HTTP status (<= 0 when the
-// connection failed) and the reply body.
-int askRequest(const String &key, const String &model, String &payload) {
-    File wav = FFat.open(ASK_PATH, FILE_READ);
-    if (!wav) return -100;
-    String prefix = String("{\"system_instruction\":{\"parts\":[{\"text\":\"") + jsonEscape(ASK_SYSTEM) + "\"}]}," +
-        "\"contents\":[{\"role\":\"user\",\"parts\":[{\"inline_data\":{\"mime_type\":\"audio/wav\",\"data\":\"";
-    String suffix = "\"}}]}],\"generationConfig\":{\"responseMimeType\":\"application/json\",\"responseSchema\":"
-        "{\"type\":\"OBJECT\",\"properties\":{\"question\":{\"type\":\"STRING\"},\"answer\":{\"type\":\"STRING\"}},"
-        "\"required\":[\"question\",\"answer\"]}}}";
-    Base64FileBody body(prefix, wav, suffix);
-
+// One HTTPS POST. Returns the HTTP status (<= 0 when the connection failed) and the reply body.
+int httpsPost(const String &url, const String &contentType, const char *authName, const String &authValue,
+              Stream *body, size_t length, String &payload) {
     WiFiClientSecure secure;
     secure.setInsecure(); // no root CA bundle on the board; the key still travels over TLS
     HTTPClient http;
     http.setTimeout(60000);
-    String url = "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent";
-    if (!http.begin(secure, url)) {
-        wav.close();
-        return -101;
-    }
-    http.addHeader("Content-Type", "application/json");
-    http.addHeader("x-goog-api-key", key);
-    Serial.printf("Ask %s: %u byte WAV, %u byte request\n", model.c_str(), wav.size(), body.total());
-    int status = http.sendRequest("POST", &body, body.total());
+    if (!http.begin(secure, url)) return -101;
+    http.addHeader("Content-Type", contentType);
+    http.addHeader(authName, authValue);
+    int status = http.sendRequest("POST", body, length);
     payload = http.getString();
     http.end();
-    wav.close();
-    Serial.printf("Ask HTTP %d after %lu ms, %u bytes\n", status, millis() - askSentMs, payload.length());
+    Serial.printf("Ask POST %s -> HTTP %d after %lu ms, %u bytes\n", url.c_str(), status, millis() - askSentMs, payload.length());
     return status;
 }
 
-void askTask(void *) {
-    String key = askKey(), model = askModel(), payload;
-    int status = askRequest(key, model, payload);
-    if ((status == 503 || status == 429) && model != ASK_FALLBACK_MODEL) {
-        status = askRequest(key, ASK_FALLBACK_MODEL, payload); // demand spikes are per model
-    }
-    askTookMs = millis() - askSentMs;
-
+String apiError(int status, const String &payload) {
+    if (status == -100) return "Recording missing";
+    if (status <= 0) return "Connection error " + String(status);
     JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, payload);
-    if (status == -100) {
-        askFail("Recording missing");
-    } else if (status <= 0) {
-        askFail("Connection error " + String(status));
-    } else if (err) {
-        askFail("HTTP " + String(status) + ": unreadable reply");
-    } else if (status != 200) {
-        const char *msg = doc["error"]["message"];
-        askFail("HTTP " + String(status) + ": " + String(msg ? msg : ""));
+    const char *msg = deserializeJson(doc, payload) ? nullptr : (const char *)doc["error"]["message"];
+    return "HTTP " + String(status) + ": " + String(msg ? msg : payload.substring(0, 120).c_str());
+}
+
+// Gemini: one generateContent call with the recording inline.
+int geminiRequest(const AskJob &job, const String &model, String &payload) {
+    File wav = FFat.open(job.path, FILE_READ);
+    if (!wav) return -100;
+    String prefix = String("{\"system_instruction\":{\"parts\":[{\"text\":\"") + jsonEscape(askSystemPrompt(true, job.lang)) + "\"}]}," +
+        "\"contents\":[{\"role\":\"user\",\"parts\":[{\"inline_data\":{\"mime_type\":\"audio/wav\",\"data\":\"";
+    String suffix = "\"}}]}],\"generationConfig\":{\"responseMimeType\":\"application/json\",\"responseSchema\":"
+        "{\"type\":\"OBJECT\",\"properties\":{\"question\":{\"type\":\"STRING\"},\"answer\":{\"type\":\"STRING\"}},"
+        "\"required\":[\"question\",\"answer\"]}}}";
+    FileBody body(prefix, wav, suffix);
+    Serial.printf("Ask Gemini %s: %u byte WAV\n", model.c_str(), wav.size());
+    int status = httpsPost("https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent",
+        "application/json", "x-goog-api-key", job.key, &body, body.total(), payload);
+    wav.close();
+    return status;
+}
+
+void askGemini(const AskJob &job, AskResult &r) {
+    String payload;
+    int status = geminiRequest(job, job.model, payload);
+    if ((status == 503 || status == 429) && job.model != ASK_FALLBACK_MODEL) {
+        status = geminiRequest(job, ASK_FALLBACK_MODEL, payload); // demand spikes are per model
+    }
+    if (status != 200) return r.fail(apiError(status, payload));
+    JsonDocument doc;
+    if (deserializeJson(doc, payload)) return r.fail("HTTP 200: unreadable reply");
+    String text;
+    for (JsonObject part : doc["candidates"][0]["content"]["parts"].as<JsonArray>()) {
+        if (!(part["thought"] | false)) text += (const char *)(part["text"] | "");
+    }
+    JsonDocument reply;
+    if (text.isEmpty()) {
+        const char *why = doc["promptFeedback"]["blockReason"] | doc["candidates"][0]["finishReason"] | "empty";
+        r.fail(String("No answer (") + why + ")");
+    } else if (deserializeJson(reply, text) || !reply["answer"].is<const char *>()) {
+        r.answer = text; // not the JSON asked for, but still worth showing
+        r.ok = true;
     } else {
-        String text;
-        for (JsonObject part : doc["candidates"][0]["content"]["parts"].as<JsonArray>()) {
-            if (!(part["thought"] | false)) text += (const char *)(part["text"] | "");
-        }
-        JsonDocument reply;
-        if (text.isEmpty()) {
-            const char *why = doc["promptFeedback"]["blockReason"] | doc["candidates"][0]["finishReason"] | "empty";
-            askFail(String("No answer (") + why + ")");
-        } else if (deserializeJson(reply, text) || !reply["answer"].is<const char *>()) {
-            askQuestion = "";
-            askAnswer = text; // not the JSON asked for, but still worth showing
-            askState = AskState::Answer;
-        } else {
-            askQuestion = (const char *)(reply["question"] | "");
-            askAnswer = (const char *)reply["answer"];
-            askState = AskState::Answer;
-        }
+        r.question = (const char *)(reply["question"] | "");
+        r.answer = (const char *)reply["answer"];
+        r.ok = true;
+    }
+}
+
+// Groq step 1: Whisper transcription, the WAV sent as a multipart file upload.
+int groqTranscribe(const AskJob &job, const char *model, String &payload) {
+    File wav = FFat.open(job.path, FILE_READ);
+    if (!wav) return -100;
+    const String B = "esp32askboundary";
+    String prefix = "--" + B + "\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n" + model + "\r\n" +
+        "--" + B + "\r\nContent-Disposition: form-data; name=\"response_format\"\r\n\r\njson\r\n" +
+        // Whisper's language detection is unreliable on a few seconds of speech (a Vietnamese
+        // question came back as Japanese), so it is told the screen language.
+        "--" + B + "\r\nContent-Disposition: form-data; name=\"language\"\r\n\r\n" + (job.lang == LANG_VI ? "vi" : "en") + "\r\n" +
+        "--" + B + "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"ask.wav\"\r\nContent-Type: audio/wav\r\n\r\n";
+    FileBody body(prefix, wav, "\r\n--" + B + "--\r\n", false);
+    Serial.printf("Ask Groq %s: %u byte WAV\n", model, wav.size());
+    int status = httpsPost("https://api.groq.com/openai/v1/audio/transcriptions", "multipart/form-data; boundary=" + B,
+        "Authorization", "Bearer " + job.key, &body, body.total(), payload);
+    wav.close();
+    return status;
+}
+
+// Groq step 2: a chat completion answering the transcribed question.
+int groqChat(const AskJob &job, const String &model, const String &question, String &payload) {
+    JsonDocument req;
+    req["model"] = model;
+    req["messages"][0]["role"] = "system";
+    req["messages"][0]["content"] = askSystemPrompt(false, job.lang);
+    req["messages"][1]["role"] = "user";
+    req["messages"][1]["content"] = question;
+    if (model.startsWith("openai/gpt-oss")) req["reasoning_effort"] = "low"; // reasoning models: keep it quick
+    else if (model.startsWith("qwen/")) req["reasoning_format"] = "hidden";
+    String body;
+    serializeJson(req, body);
+    StreamString stream;
+    stream.print(body);
+    return httpsPost("https://api.groq.com/openai/v1/chat/completions", "application/json", "Authorization",
+        "Bearer " + job.key, &stream, body.length(), payload);
+}
+
+void askGroq(const AskJob &job, AskResult &r) {
+    String payload;
+    int status = groqTranscribe(job, GROQ_STT_MODEL, payload);
+    if (status == 404 || status == 400) status = groqTranscribe(job, GROQ_STT_FALLBACK, payload); // model retired
+    if (status != 200) return r.fail(apiError(status, payload));
+    JsonDocument doc;
+    if (deserializeJson(doc, payload)) return r.fail("Transcription unreadable");
+    String question = (const char *)(doc["text"] | "");
+    question.trim();
+    if (question.isEmpty()) return r.fail(T("Nothing heard", "Không nghe thấy gì"));
+    r.question = question;
+
+    status = groqChat(job, job.model, question, payload);
+    if ((status == 503 || status == 429 || status == 404 || status == 400) && job.model != GROQ_FALLBACK_MODEL) {
+        status = groqChat(job, GROQ_FALLBACK_MODEL, question, payload);
+    }
+    if (status != 200) return r.fail(apiError(status, payload));
+    doc.clear();
+    if (deserializeJson(doc, payload)) return r.fail("HTTP 200: unreadable reply");
+    String answer = (const char *)(doc["choices"][0]["message"]["content"] | "");
+    int think = answer.indexOf("</think>"); // a reasoning model that ignored reasoning_format
+    if (think >= 0) answer = answer.substring(think + 8);
+    answer.trim();
+    if (answer.isEmpty()) return r.fail(T("No answer", "Không có câu trả lời"));
+    r.answer = answer;
+    r.ok = true;
+}
+
+void askTask(void *arg) {
+    AskJob job = *(AskJob *)arg;
+    delete (AskJob *)arg;
+    AskResult r;
+    if (job.provider == ASK_GROQ) askGroq(job, r);
+    else askGemini(job, r);
+    if (job.id != askJobId) { // cancelled, or a newer question has been sent since
+        Serial.printf("Ask: reply to cancelled question %u dropped\n", job.id);
+    } else {
+        askTookMs = millis() - askSentMs;
+        askQuestion = r.question;
+        askAnswer = r.answer;
+        if (r.ok) askState = AskState::Answer;
+        else askFail(r.error);
     }
     vTaskDelete(nullptr);
 }
@@ -1177,7 +1695,7 @@ struct AskLine {
 };
 std::vector<AskLine> askLines;
 int askScroll = 0;
-const int ASK_TOP = 28, ASK_LINE_H = 18, ASK_ROWS = (320 - ASK_TOP) / ASK_LINE_H, ASK_TEXT_W = 226;
+const int ASK_TOP = CONTENT_Y, ASK_LINE_H = 22, ASK_ROWS = (320 - ASK_TOP) / ASK_LINE_H, ASK_TEXT_W = 212;
 
 void askWrap(const String &text, uint16_t color) {
     int start = 0;
@@ -1190,7 +1708,7 @@ void askWrap(const String &text, uint16_t color) {
             int sp = para.indexOf(' ', i);
             String word = para.substring(i, sp < 0 ? para.length() : sp);
             String next = cur.length() ? cur + " " + word : word;
-            if (cur.length() && u8f.getUTF8Width(next.c_str()) > ASK_TEXT_W) {
+            if (cur.length() && aaWidth(ui15, next) > ASK_TEXT_W) {
                 askLines.push_back({cur, color});
                 cur = word;
             } else {
@@ -1206,68 +1724,135 @@ void askWrap(const String &text, uint16_t color) {
 
 void askDrawText() {
     for (int r = 0; r < ASK_ROWS; r++) {
-        int y = ASK_TOP + r * ASK_LINE_H;
-        tft.fillRect(0, y, 234, ASK_LINE_H, ST77XX_BLACK);
         int i = askScroll + r;
-        if (i >= (int)askLines.size()) continue;
-        u8f.setForegroundColor(askLines[i].color);
-        u8f.setCursor(6, y + 14);
-        u8f.print(askLines[i].text);
+        bool has = i < (int)askLines.size();
+        uiBox(ui15, 14, ASK_TOP + r * ASK_LINE_H, ASK_TEXT_W + 4, ASK_LINE_H, has ? askLines[i].text : String(),
+              has ? askLines[i].color : UI_TXT, UI_BG);
     }
     int total = askLines.size();
-    tft.fillRect(236, ASK_TOP, 4, ASK_ROWS * ASK_LINE_H, ST77XX_BLACK);
+    tft.fillRect(233, ASK_TOP, 4, ASK_ROWS * ASK_LINE_H, UI_BG);
     if (total > ASK_ROWS) { // scrollbar
-        int h = ASK_ROWS * ASK_LINE_H, thumb = max(12, h * ASK_ROWS / total);
+        int h = ASK_ROWS * ASK_LINE_H, thumb = max(16, h * ASK_ROWS / total);
         int y = ASK_TOP + (h - thumb) * askScroll / (total - ASK_ROWS);
-        tft.fillRect(236, y, 3, thumb, tft.color565(120, 120, 120));
+        tft.fillRoundRect(233, y, 3, thumb, 1, rgb565(90, 96, 110));
     }
 }
 
+// Provider logos for the Ready screen, drawn from shapes like the menu icons.
+
+// Gemini: a four-point sparkle with concave sides, |x|^e + |y|^e <= r^e with e < 1, shaded from
+// blue at the top left through purple to pink at the bottom right. Drawn a row at a time.
+void drawGeminiLogo(int cx, int cy, int r) {
+    const float e = 0.72f, re = powf(r, e);
+    const uint8_t stops[3][3] = {{60, 130, 245}, {150, 110, 235}, {230, 110, 150}};
+    static uint16_t row[2 * 60 + 1];
+    for (int dy = -r; dy <= r; dy++) {
+        float rem = re - powf(abs(dy), e);
+        if (rem <= 0) continue;
+        int w = (int)powf(rem, 1 / e);
+        if (w < 1 && abs(dy) > r - 3) continue; // no one-pixel spikes at the tips
+        for (int x = -w; x <= w; x++) {
+            float t = constrain((x + dy) / (2.0f * r) + 0.5f, 0.0f, 1.0f);
+            const uint8_t *a = stops[t < 0.5f ? 0 : 1], *b = stops[t < 0.5f ? 1 : 2];
+            float u = t < 0.5f ? t * 2 : (t - 0.5f) * 2;
+            row[x + w] = tft.color565(a[0] + (b[0] - a[0]) * u, a[1] + (b[1] - a[1]) * u, a[2] + (b[2] - a[2]) * u);
+        }
+        tft.drawRGBBitmap(cx - w, cy + dy, row, 2 * w + 1, 1);
+    }
+}
+
+// Rows `from`..`to` (relative to cy) of a ring, as horizontal spans.
+void fillRingRows(int cx, int cy, int rin, int rout, int from, int to, uint16_t color) {
+    for (int dy = from; dy <= to; dy++) {
+        if (abs(dy) > rout) continue;
+        int wo = (int)sqrtf(rout * rout - dy * dy);
+        if (abs(dy) < rin) {
+            int wi = (int)ceilf(sqrtf(rin * rin - dy * dy));
+            tft.drawFastHLine(cx - wo, cy + dy, wo - wi + 1, color);
+            tft.drawFastHLine(cx + wi, cy + dy, wo - wi + 1, color);
+        } else {
+            tft.drawFastHLine(cx - wo, cy + dy, 2 * wo + 1, color);
+        }
+    }
+}
+
+// Groq: a white lowercase "g" (ring bowl, right stem, bottom hook) on an orange rounded square.
+void drawGroqLogo(int cx, int cy) {
+    const uint16_t orange = tft.color565(245, 80, 54);
+    const int ro = 16, ri = 9, gx = cx - 3, bowlY = cy - 8, hookY = cy + 12;
+    tft.fillRoundRect(cx - 42, cy - 42, 84, 84, 20, orange);
+    fillRingRows(gx, bowlY, ri, ro, -ro, ro, UI_TXT);
+    tft.fillRect(gx + ri, bowlY - ro + 2, ro - ri + 1, hookY - (bowlY - ro + 2) + 1, UI_TXT);
+    fillRingRows(gx, hookY, ri, ro, 1, ro, UI_TXT);
+}
+
+// A soft glow behind the provider logo: discs from large to small, each a little closer to `c`.
+void uiGlow(int cx, int cy, int r, uint8_t cr, uint8_t cg, uint8_t cb) {
+    for (int k = r; k > 0; k -= 2) {
+        float a = 1.0f - (float)k / r;
+        a = a * a;
+        tft.fillCircle(cx, cy, k, rgb565(cr * a, cg * a, cb * a));
+    }
+}
+
+const int ASK_LOGO_Y = 140;
 void askDraw() {
-    header("Ask AI");
+    header(T("Ask AI", "Hỏi AI"));
     switch (askState) {
-        case AskState::Idle:
-            tft.fillRoundRect(100, 60, 40, 64, 20, tft.color565(255, 90, 160));
-            tft.drawCircleHelper(120, 100, 32, 0x4 | 0x8, tft.color565(255, 90, 160));
-            tft.drawCircleHelper(120, 100, 33, 0x4 | 0x8, tft.color565(255, 90, 160));
-            tft.fillRect(118, 133, 5, 20, tft.color565(255, 90, 160));
-            tft.fillRect(100, 152, 41, 4, tft.color565(255, 90, 160));
-            if (askKey().isEmpty()) line(200, "No API key", ST77XX_RED, 2);
-            else line(200, "Ready", ST77XX_WHITE, 2);
+        case AskState::Idle: {
+            AskProvider pv = askProvider();
+            if (pv == ASK_GROQ) {
+                uiGlow(120, ASK_LOGO_Y, 72, 110, 40, 20);
+                drawGroqLogo(120, ASK_LOGO_Y);
+            } else {
+                uiGlow(120, ASK_LOGO_Y, 72, 60, 45, 140);
+                drawGeminiLogo(120, ASK_LOGO_Y, 44);
+            }
+            uiBox(ui15b, 0, 214, W, 24, ASK_PROVIDER_NAMES[pv], UI_TXT, UI_BG, AL_CENTER);
+            if (askKey().isEmpty()) uiBox(ui12, 0, 238, W, 20, T("No API key", "Chưa có khóa API"), UI_RED, UI_BG, AL_CENTER);
+            else if (askWasCancelled) uiBox(ui12, 0, 238, W, 20, T("Cancelled", "Đã hủy"), UI_YELLOW, UI_BG, AL_CENTER);
+            else uiBox(ui12, 0, 238, W, 20, T("Ready", "Sẵn sàng"), UI_SUB, UI_BG, AL_CENTER);
+            int x0 = 120 - (ASK_PROVIDER_COUNT - 1) * 6; // a dot per provider, the one in use lit
+            for (int i = 0; i < ASK_PROVIDER_COUNT; i++) tft.fillCircle(x0 + i * 12, 280, 3, i == pv ? UI_TXT : UI_LINE);
             break;
+        }
         case AskState::Recording:
-            tft.drawCircle(120, 90, 45, ST77XX_WHITE);
-            line(260, "Listening", ST77XX_RED, 2);
+            tft.drawCircle(120, ASK_LOGO_Y, 48, UI_LINE);
+            tft.drawCircle(120, ASK_LOGO_Y, 49, UI_LINE);
+            uiBox(ui15, 0, 236, W, 24, T("Listening", "Đang nghe"), UI_RED, UI_BG, AL_CENTER);
             break;
         case AskState::Thinking:
-            line(140, "Thinking", ST77XX_YELLOW, 3);
+            uiBox(ui15b, 0, 180, W, 24, T("Thinking", "Đang nghĩ"), UI_TXT, UI_BG, AL_CENTER);
             break;
         case AskState::Answer:
             askLines.clear();
             askScroll = 0;
             if (askQuestion.length()) {
-                askWrap(askQuestion, tft.color565(120, 200, 255));
-                askLines.push_back({"", ST77XX_WHITE});
+                askWrap(askQuestion, ACCENT);
+                askLines.push_back({"", UI_TXT});
             }
-            askWrap(askAnswer, ST77XX_WHITE);
+            askWrap(askAnswer, UI_TXT);
             askDrawText();
             break;
         case AskState::Failed:
-            line(40, "Error", ST77XX_RED, 2);
+            uiBox(ui15b, 14, CONTENT_Y, 200, 24, T("Error", "Lỗi"), UI_RED, UI_BG);
             askLines.clear();
-            askWrap(askError, ST77XX_WHITE);
-            for (int i = 0; i < (int)askLines.size() && i < 13; i++) {
-                u8f.setForegroundColor(ST77XX_WHITE);
-                u8f.setCursor(6, 80 + i * ASK_LINE_H);
-                u8f.print(askLines[i].text);
+            askWrap(askError, UI_TXT2);
+            for (int i = 0; i < (int)askLines.size() && i < 10; i++) {
+                uiBox(ui15, 14, CONTENT_Y + 30 + i * ASK_LINE_H, ASK_TEXT_W, ASK_LINE_H, askLines[i].text, UI_TXT2, UI_BG);
             }
             break;
     }
 }
 
 AskState askShown = AskState::Idle; // what askDraw last drew, so the tick sees task updates
+// Opening the app starts on the Ready screen, where the knob picks the provider. The one exception
+// is an answer that arrived while the app was closed (askShown is still Thinking): that is shown.
 void askEnter() {
     if (askState == AskState::Recording && !recording) askState = AskState::Idle; // left mid-question
+    bool unseen = askShown == AskState::Thinking;
+    askWasCancelled = false;
+    if ((askState == AskState::Answer || askState == AskState::Failed) && !unseen) askState = AskState::Idle;
     askShown = askState;
     askDraw();
 }
@@ -1275,20 +1860,35 @@ void askEnter() {
 void askSend() {
     recStop();
     if (recSamples < MIC_RATE / 2) {
-        askFail("Too short");
+        askFail(T("Too short", "Quá ngắn"));
     } else {
         askError = "";
+        AskProvider pv = askProvider();
+        AskJob *job = new AskJob{pv, askKey(pv), askModel(pv), ASK_PATHS[askSlot], ++askJobId, uiLang};
         askState = AskState::Thinking;
         askSentMs = millis();
-        xTaskCreatePinnedToCore(askTask, "ask", 12288, nullptr, 1, nullptr, 1);
+        xTaskCreatePinnedToCore(askTask, "ask", 12288, job, 1, nullptr, 1);
     }
 }
 
 // A press on a long answer pages down first (one line of overlap, so reading stays continuous);
 // only on the last page does it start the next question. This is how a board with just BOOT and
 // the back button reads a long answer.
+// Back while listening or waiting: the recording is dropped, or the reply on its way is ignored,
+// and the app returns to Ready instead of leaving.
+void askCancel() {
+    if (askState == AskState::Recording) recStop();
+    askJobId++;
+    askState = AskState::Idle;
+    askWasCancelled = true;
+    askShown = askState;
+    askDraw();
+    Serial.println("Ask cancelled");
+}
+
 void askPress() {
     if (askState == AskState::Thinking) return;
+    askWasCancelled = false;
     int maxScroll = max(0, (int)askLines.size() - ASK_ROWS);
     if (askState == AskState::Answer && askScroll < maxScroll) {
         askScroll = min(askScroll + ASK_ROWS - 1, maxScroll);
@@ -1298,11 +1898,12 @@ void askPress() {
     if (askState == AskState::Recording) {
         askSend();
     } else if (askKey().isEmpty()) {
-        askFail("No API key. Add it on the web page.");
-    } else if (recStart(ASK_PATH)) {
+        askFail(T("No API key. Add it on the web page.", "Chưa có khóa API. Thêm trên trang web."));
+    } else if (recStart(ASK_PATHS[askSlot ^ 1])) {
+        askSlot ^= 1;
         askState = AskState::Recording;
     } else {
-        askFail("Cannot record");
+        askFail(T("Cannot record", "Không ghi âm được"));
     }
     askShown = askState;
     askDraw();
@@ -1326,29 +1927,156 @@ void askTick() {
             return;
         }
         bool on = (millis() - recStartMs) % 1000 < 600;
-        tft.fillCircle(120, 90, 38, on ? ST77XX_RED : tft.color565(60, 0, 0));
-        tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
-        tft.setTextSize(5);
-        tft.setCursor(45, 160);
-        tft.print(mmss(sec));
+        tft.fillCircle(120, ASK_LOGO_Y, 40, on ? UI_RED : rgb565(70, 20, 20));
+        uiBox(num34, 0, 192, W, 40, mmss(sec), UI_TXT, UI_BG, AL_CENTER);
         float db = micDb;
-        int w = micScale(db, 224);
-        tft.fillRect(8, 222, w, 14, micColor(db));
-        tft.fillRect(8 + w, 222, 224 - w, 14, tft.color565(40, 40, 40));
+        uiBar(40, 270, 160, 8, micScale(db, 1000) / 1000.0f, micColor(db));
     } else if (askState == AskState::Thinking) {
-        int dots = (millis() - askSentMs) / 500 % 4;
-        line(140, String("Thinking") + String("...").substring(0, dots) + "   ", ST77XX_YELLOW, 3);
-        line(180, String((millis() - askSentMs) / 1000) + " s   ", tft.color565(150, 150, 150), 2);
+        int phase = (millis() - askSentMs) / 300 % 3; // three dots, one lit at a time
+        for (int i = 0; i < 3; i++) tft.fillCircle(100 + i * 20, ASK_LOGO_Y, 6, i == phase ? ACCENT : UI_LINE);
+        uiBox(ui12, 0, 206, W, 20, String((millis() - askSentMs) / 1000) + " s", UI_SUB, UI_BG, AL_CENTER);
     }
 }
 
 void askRotate(int dir) {
+    if (askState == AskState::Idle || askState == AskState::Failed) { // pick the provider
+        askSetProvider((AskProvider)((askProvider() + (dir > 0 ? 1 : ASK_PROVIDER_COUNT - 1)) % ASK_PROVIDER_COUNT));
+        askState = AskState::Idle;
+        askWasCancelled = false;
+        askShown = askState;
+        askDraw();
+        return;
+    }
     if (askState != AskState::Answer) return;
     int maxScroll = max(0, (int)askLines.size() - ASK_ROWS);
     int next = constrain(askScroll + dir, 0, maxScroll);
     if (next == askScroll) return;
     askScroll = next;
     askDrawText();
+}
+
+// ---------- iPhone notifications ----------
+// Received over Bluetooth (include/ancs_client.h). The newest 20 are kept; a new one pops up as
+// a banner at the top of whatever is on screen for a few seconds.
+const char *BLE_NAME = "ESP32 Device";
+struct Note {
+    AncsNote n;
+    unsigned long ms;
+};
+std::vector<Note> notes; // newest first
+int notesSel = 0, notesTop = 0;
+bool notesDetail = false;
+unsigned long bannerUntilMs = 0;
+int unreadNotes = 0;
+
+String appLabel(const String &bundle) { // a friendly name for the apps people get messages from
+    static const char *MAP[][2] = {{"vn.com.vng.zingalo", "Zalo"}, {"com.vng.zalo", "Zalo"}, {"com.facebook.Messenger", "Messenger"},
+        {"com.apple.MobileSMS", "Tin nhắn"}, {"com.apple.mobilephone", "Điện thoại"}, {"com.google.Gmail", "Gmail"},
+        {"com.apple.mobilemail", "Mail"}, {"net.whatsapp.WhatsApp", "WhatsApp"}, {"ph.telegra.Telegraph", "Telegram"},
+        {"com.facebook.Facebook", "Facebook"}, {"com.burbn.instagram", "Instagram"}, {"com.tinyspeck.chatlyio", "Slack"},
+        {"com.apple.reminders", "Lời nhắc"}, {"com.apple.mobilecal", "Lịch"}, {"com.google.ios.youtube", "YouTube"}};
+    for (auto &m : MAP) {
+        if (bundle == m[0]) return uiLang == LANG_VI ? m[1] : (strcmp(m[0], "com.apple.MobileSMS") == 0 ? "Messages"
+            : strcmp(m[0], "com.apple.mobilephone") == 0 ? "Phone" : strcmp(m[0], "com.apple.reminders") == 0 ? "Reminders"
+            : strcmp(m[0], "com.apple.mobilecal") == 0 ? "Calendar" : m[1]);
+    }
+    int dot = bundle.lastIndexOf('.');
+    return dot >= 0 ? bundle.substring(dot + 1) : bundle;
+}
+
+String noteAgo(unsigned long ms) {
+    unsigned long s = (millis() - ms) / 1000;
+    if (s < 60) return T("now", "vừa xong");
+    if (s < 3600) return String(s / 60) + T(" min", " phút");
+    return String(s / 3600) + T(" h", " giờ");
+}
+
+String oneLine(String s) {
+    s.replace("\n", " ");
+    s.replace("\r", " ");
+    return s;
+}
+
+const int NOTE_ROW_H = 66, NOTE_ROWS = 3;
+void notesDrawRow(int i) {
+    if (i < notesTop || i >= notesTop + NOTE_ROWS) return;
+    int y = CONTENT_Y + 22 + (i - notesTop) * NOTE_ROW_H;
+    if (i >= (int)notes.size()) {
+        tft.fillRect(0, y, W, NOTE_ROW_H, UI_BG);
+        return;
+    }
+    const AncsNote &n = notes[i].n;
+    bool sel = i == notesSel;
+    uint16_t bg = sel ? UI_CARD_SEL : UI_CARD;
+    tft.fillRect(0, y, W, NOTE_ROW_H, UI_BG);
+    tft.fillRoundRect(8, y, 224, NOTE_ROW_H - 4, 12, bg);
+    uiBox(ui12, 18, y + 2, 140, 21, appLabel(n.app), n.category == 1 ? UI_GREEN : ACCENT, bg);
+    uiBox(ui12, 158, y + 2, 64, 21, noteAgo(notes[i].ms), UI_SUB, bg, AL_RIGHT);
+    uiBox(ui15b, 18, y + 20, 204, 23, oneLine(n.title), UI_TXT, bg);
+    uiBox(ui12, 18, y + 41, 204, 20, oneLine(n.message), UI_TXT2, bg);
+}
+
+void notesDrawStatus() {
+    bool ok = ancs::ready;
+    String s = ok ? String(T("iPhone connected", "iPhone đã kết nối"))
+             : ancs::connected ? String(T("Pairing...", "Đang ghép đôi..."))
+             : String(T("Not connected · ", "Chưa kết nối · ")) + BLE_NAME;
+    tft.fillCircle(18, CONTENT_Y + 8, 4, ok ? UI_GREEN : ancs::connected ? UI_YELLOW : UI_SUB);
+    uiBox(ui12, 28, CONTENT_Y - 1, 200, 18, s, UI_SUB, UI_BG);
+}
+
+void notesDraw() {
+    header(T("Notifications", "Thông báo"));
+    notesDrawStatus();
+    if (notesDetail && notesSel < (int)notes.size()) { // one notification in full
+        const AncsNote &n = notes[notesSel].n;
+        uiBox(ui12, 14, CONTENT_Y + 22, 212, 18, appLabel(n.app) + " · " + noteAgo(notes[notesSel].ms), ACCENT, UI_BG);
+        askLines.clear();
+        askWrap(n.title, UI_TXT);
+        askWrap(n.message, UI_TXT2);
+        for (int i = 0; i < (int)askLines.size() && i < 10; i++) {
+            uiBox(i == 0 ? ui15b : ui15, 14, CONTENT_Y + 42 + i * 22, 212, 22, askLines[i].text, askLines[i].color, UI_BG);
+        }
+        return;
+    }
+    if (notes.empty()) {
+        line(CONTENT_Y + 30, T("No notifications", "Chưa có thông báo"), UI_SUB);
+        return;
+    }
+    for (int i = notesTop; i < notesTop + NOTE_ROWS; i++) notesDrawRow(i);
+}
+
+void notesEnter() {
+    notesDetail = false;
+    unreadNotes = 0;
+    notesSel = constrain(notesSel, 0, max(0, (int)notes.size() - 1));
+    notesDraw();
+}
+void notesPress() { // OK opens the selected one in full, or goes back to the list
+    if (notes.empty()) return;
+    notesDetail = !notesDetail;
+    notesDraw();
+}
+void notesRotate(int dir) {
+    if (notes.empty() || notesDetail) return;
+    int prev = notesSel;
+    notesSel = constrain(notesSel + dir, 0, (int)notes.size() - 1);
+    if (notesSel == prev) return;
+    if (notesSel < notesTop || notesSel >= notesTop + NOTE_ROWS) {
+        notesTop = constrain(notesSel - (dir > 0 ? NOTE_ROWS - 1 : 0), 0, max(0, (int)notes.size() - NOTE_ROWS));
+        for (int i = notesTop; i < notesTop + NOTE_ROWS; i++) notesDrawRow(i);
+    } else {
+        notesDrawRow(prev);
+        notesDrawRow(notesSel);
+    }
+}
+void notesTick() {
+    static bool lastReady = false, lastConn = false;
+    if (ancs::ready != lastReady || ancs::connected != lastConn) {
+        lastReady = ancs::ready;
+        lastConn = ancs::connected;
+        notesDrawStatus();
+    }
 }
 
 // ---------- timer ----------
@@ -1379,34 +2107,30 @@ String timerText() {
 }
 
 // Digits at text size 6 are 36 px wide: minutes at x=30, the colon at 102, seconds at 138.
+// Minutes and seconds in fixed boxes either side of the colon, so the digits don't shift as they
+// change; the field being set is blue and underlined. A bar shows the time left while running.
+const int TIMER_Y = 92, TIMER_H = 70;
 void timerDraw() {
     bool setting = timerState == TimerState::Set;
-    const char *label = setting ? (timerField == 0 ? "Set minutes" : "Set seconds")
-                      : timerState == TimerState::Running ? "Running"
-                      : timerState == TimerState::Paused ? "Paused" : "Time's up!";
-    uint16_t color = timerState == TimerState::Done ? ST77XX_RED
-                   : timerState == TimerState::Running ? ST77XX_GREEN : ST77XX_WHITE;
+    const char *label = setting ? (timerField == 0 ? T("Set minutes", "Chỉnh phút") : T("Set seconds", "Chỉnh giây"))
+                      : timerState == TimerState::Running ? T("Running", "Đang chạy")
+                      : timerState == TimerState::Paused ? T("Paused", "Tạm dừng") : T("Time's up!", "Hết giờ!");
+    uint16_t base = timerState == TimerState::Done ? UI_RED : UI_TXT;
+    uint16_t labelColor = timerState == TimerState::Running ? UI_GREEN : timerState == TimerState::Paused ? UI_YELLOW
+                        : timerState == TimerState::Done ? UI_RED : UI_SUB;
     String t = timerText();
-    // While setting, the field being edited is yellow and underlined.
-    uint16_t minColor = setting && timerField == 0 ? ST77XX_YELLOW : color;
-    uint16_t secColor = setting && timerField == 1 ? ST77XX_YELLOW : color;
-    tft.setTextSize(6);
-    tft.setTextColor(minColor, ST77XX_BLACK);
-    tft.setCursor(30, 110);
-    tft.print(t.substring(0, 2));
-    tft.setTextColor(color, ST77XX_BLACK);
-    tft.print(":");
-    tft.setTextColor(secColor, ST77XX_BLACK);
-    tft.print(t.substring(3, 5));
-    tft.fillRect(30, 162, 70, 4, setting && timerField == 0 ? ST77XX_YELLOW : ST77XX_BLACK);
-    tft.fillRect(138, 162, 70, 4, setting && timerField == 1 ? ST77XX_YELLOW : ST77XX_BLACK);
-    String l = label;
-    while (l.length() < 12) l += ' ';
-    line(190, l, color, 2);
+    uiBox(num68, 8, TIMER_Y, 98, TIMER_H, t.substring(0, 2), setting && timerField == 0 ? ACCENT : base, UI_BG, AL_RIGHT);
+    uiBox(num68, 106, TIMER_Y, 28, TIMER_H, ":", base, UI_BG, AL_CENTER);
+    uiBox(num68, 134, TIMER_Y, 98, TIMER_H, t.substring(3, 5), setting && timerField == 1 ? ACCENT : base, UI_BG, AL_LEFT);
+    tft.fillRoundRect(28, TIMER_Y + TIMER_H + 4, 72, 4, 2, setting && timerField == 0 ? ACCENT : UI_BG);
+    tft.fillRoundRect(140, TIMER_Y + TIMER_H + 4, 72, 4, 2, setting && timerField == 1 ? ACCENT : UI_BG);
+    uiBox(ui15, 0, 196, W, 24, label, labelColor, UI_BG, AL_CENTER);
+    if (setting || timerSetMs() == 0) tft.fillRect(30, 238, 180, 8, UI_BG);
+    else uiBar(30, 238, 180, 8, (float)timerRemainingMs() / timerSetMs(), labelColor);
 }
 
 void timerEnter() {
-    header("Timer");
+    header(T("Timer", "Hẹn giờ"));
     timerDraw();
 }
 
@@ -1473,7 +2197,7 @@ const char *WEATHER_URL =
     "https://api.open-meteo.com/v1/forecast?latitude=21.03&longitude=105.85"
     "&current=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m"
     "&hourly=temperature_2m,weather_code&forecast_hours=5&timezone=Asia%2FBangkok";
-const char *WEATHER_CITY = "Ha Noi";
+const char *WEATHER_CITY = "Hà Nội";
 
 struct Weather {
     bool ok = false;
@@ -1497,11 +2221,11 @@ WeatherKind weatherKind(int code) { // WMO weather codes
 
 const char *weatherText(int code) {
     switch (weatherKind(code)) {
-        case WX_SUN: return "Clear";
-        case WX_PARTLY: return "Partly cloudy";
-        case WX_RAIN: return code >= 80 ? "Showers" : code <= 57 ? "Drizzle" : "Rain";
-        case WX_STORM: return "Thunderstorm";
-        default: return code >= 45 && code <= 48 ? "Fog" : "Cloudy";
+        case WX_SUN: return T("Clear", "Trời quang");
+        case WX_PARTLY: return T("Partly cloudy", "Ít mây");
+        case WX_RAIN: return code >= 80 ? T("Showers", "Mưa rào") : code <= 57 ? T("Drizzle", "Mưa phùn") : T("Rain", "Mưa");
+        case WX_STORM: return T("Thunderstorm", "Dông");
+        default: return code >= 45 && code <= 48 ? T("Fog", "Sương mù") : T("Cloudy", "Nhiều mây");
     }
 }
 
@@ -1547,7 +2271,7 @@ bool weatherFetch() {
     HTTPClient http;
     http.setTimeout(8000);
     if (!http.begin(secure, WEATHER_URL)) {
-        weather.error = "No connection";
+        weather.error = T("No connection", "Mất kết nối");
         return false;
     }
     int status = http.GET();
@@ -1580,53 +2304,387 @@ bool weatherFetch() {
 }
 
 void weatherDraw() {
-    header("Weather");
+    header(T("Weather", "Thời tiết"));
     if (!weather.ok) {
-        line(60, "Unavailable", ST77XX_RED, 2);
-        line(90, weather.error, ST77XX_WHITE, 1);
+        line(CONTENT_Y, T("Unavailable", "Không có dữ liệu"), UI_RED);
+        line(CONTENT_Y + 26, weather.error, UI_SUB, 1);
         return;
     }
-    line(34, WEATHER_CITY, ST77XX_CYAN, 2);
-    drawWeatherIcon(weatherKind(weather.code), 62, 100, 2);
-    tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
-    tft.setTextSize(5);
-    tft.setCursor(124, 80);
-    tft.print(lround(weather.temp));
-    int degX = tft.getCursorX() + 6;
-    tft.drawCircle(degX, 84, 5, ST77XX_WHITE); // the built-in font has no degree sign
-    tft.drawCircle(degX, 84, 4, ST77XX_WHITE);
-    line(150, weatherText(weather.code), ST77XX_WHITE, 2);
-    line(178, "Humidity " + String(weather.humidity) + "%", ST77XX_WHITE, 1);
-    line(192, "Wind " + String(lround(weather.wind)) + " km/h", ST77XX_WHITE, 1);
-    tft.drawFastHLine(8, 214, W - 16, tft.color565(60, 60, 70));
+    uiText(ui12, 14, CONTENT_Y - 6, WEATHER_CITY, UI_SUB);
+    drawWeatherIcon(weatherKind(weather.code), 62, 112, 2);
+    uiBox(num34, 112, 88, 114, 40, String(lround(weather.temp)) + "°", UI_TXT, UI_BG);
+    uiBox(ui15b, 112, 128, 114, 22, weatherText(weather.code), UI_TXT, UI_BG);
+    uiBox(ui12, 14, 160, W - 28, 18, T("Humidity ", "Độ ẩm ") + String(weather.humidity) + "%   ·   " + T("Wind ", "Gió ") +
+          String(lround(weather.wind)) + " km/h", UI_SUB, UI_BG);
+    const int cy = 190;
+    tft.fillRoundRect(8, cy, 224, 120, 14, UI_CARD);
     for (int i = 0; i < 4; i++) {
-        int cx = 30 + i * 60;
-        tft.setTextSize(1);
-        tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
-        tft.setCursor(cx - 9, 224);
-        tft.printf("%02dh", weather.hourH[i]);
-        drawWeatherIcon(weatherKind(weather.hourCode[i]), cx, 256, 1);
-        tft.setTextSize(2);
-        tft.setCursor(cx - 12, 284);
-        tft.print(weather.hourTemp[i]);
-        tft.drawCircle(tft.getCursorX() + 3, 286, 2, ST77XX_WHITE);
+        int cx = 8 + 28 + i * 56;
+        uiBox(ui12, cx - 26, cy + 8, 52, 18, String(weather.hourH[i]) + "h", UI_SUB, UI_CARD, AL_CENTER);
+        drawWeatherIcon(weatherKind(weather.hourCode[i]), cx, cy + 56, 1);
+        uiBox(ui15b, cx - 26, cy + 88, 52, 22, String(weather.hourTemp[i]) + "°", UI_TXT, UI_CARD, AL_CENTER);
     }
 }
 
 void weatherEnter() {
     if (!weather.ok || millis() - weather.fetchedMs > 10 * 60000UL) { // refresh at most every 10 minutes
-        header("Weather");
-        line(60, "Loading...", ST77XX_WHITE, 2);
+        header(T("Weather", "Thời tiết"));
+        line(CONTENT_Y, T("Loading...", "Đang tải..."), UI_SUB);
         weatherFetch();
     }
     weatherDraw();
 }
 
 void weatherPress() { // a press forces a refresh
-    header("Weather");
-    line(60, "Loading...", ST77XX_WHITE, 2);
+    header(T("Weather", "Thời tiết"));
+    line(CONTENT_Y, T("Loading...", "Đang tải..."), UI_SUB);
     weatherFetch();
     weatherDraw();
+}
+
+// ---------- markets ----------
+// Gold (vang.today: SJC bars and rings, world spot), USD/VND (Vietcombank), VN-Index (SSI) and
+// Bitcoin (CoinGecko): all free and keyless. Fetched in a background task so the screen and
+// buttons stay live; refreshed at most every 5 minutes (Vietcombank asks for no more than that),
+// or at once with OK.
+struct Quote {
+    bool ok = false;
+    double value = 0, value2 = 0, change = 0, changePct = 0; // value2: a second price (buy, or VND)
+};
+struct Markets {
+    Quote goldBar, goldRing, goldWorld, usd, vnindex, btc;
+    unsigned long fetchedMs = 0;
+    String error;
+} markets;
+volatile bool marketsFetching = false, marketsChanged = false;
+
+// Number with grouped thousands, in the screen language's convention (1.234,5 or 1,234.5).
+String fmtNum(double v, int decimals) {
+    char raw[32];
+    snprintf(raw, sizeof(raw), "%.*f", decimals, fabs(v));
+    String s = raw, frac;
+    int dot = s.indexOf('.');
+    if (dot >= 0) {
+        frac = s.substring(dot + 1);
+        s = s.substring(0, dot);
+    }
+    bool vi = uiLang == LANG_VI;
+    String out;
+    for (int i = 0; i < (int)s.length(); i++) {
+        if (i && (s.length() - i) % 3 == 0) out += vi ? '.' : ',';
+        out += s[i];
+    }
+    if (frac.length()) out += String(vi ? ',' : '.') + frac;
+    return (v < 0 ? "-" : "") + out;
+}
+
+bool httpsGet(const char *url, String &body) {
+    WiFiClientSecure secure;
+    secure.setInsecure(); // public data; no root CA bundle on the board
+    HTTPClient http;
+    http.setTimeout(8000);
+    if (!http.begin(secure, url)) return false;
+    http.addHeader("User-Agent", "Mozilla/5.0 (ESP32)");
+    int status = http.GET();
+    body = status == 200 ? http.getString() : String();
+    http.end();
+    if (status != 200) Serial.printf("GET %s -> %d\n", url, status);
+    return status == 200;
+}
+
+// "25,760.00" -> 25760
+double parseGrouped(const String &s) {
+    String digits;
+    for (char c : s) {
+        if (isdigit((unsigned char)c) || c == '.') digits += c;
+    }
+    return digits.toDouble();
+}
+
+void marketsTask(void *) {
+    Markets m;
+    String body;
+    JsonDocument doc;
+    if (httpsGet("https://www.vang.today/api/prices", body) && !deserializeJson(doc, body)) {
+        auto take = [&](const char *key, Quote &q) {
+            JsonObject p = doc["prices"][key];
+            if (p.isNull()) return;
+            q.value = p["sell"] | 0.0;
+            q.value2 = p["buy"] | 0.0;
+            q.change = p["change_sell"] | 0.0;
+            q.ok = q.value > 0;
+        };
+        take("SJL1L10", m.goldBar);
+        take("SJ9999", m.goldRing);
+        JsonObject w = doc["prices"]["XAUUSD"];
+        m.goldWorld.value = w["buy"] | 0.0;
+        m.goldWorld.ok = m.goldWorld.value > 0;
+    }
+    if (httpsGet("https://portal.vietcombank.com.vn/Usercontrols/TVPortal.TyGia/pXML.aspx", body)) {
+        int at = body.indexOf("CurrencyCode=\"USD\"");
+        auto attr = [&](const char *name) {
+            int a = body.indexOf(String(name) + "=\"", at);
+            if (a < 0) return 0.0;
+            a += strlen(name) + 2;
+            return parseGrouped(body.substring(a, body.indexOf('"', a)));
+        };
+        if (at >= 0) {
+            m.usd.value = attr("Sell");
+            m.usd.value2 = attr("Buy");
+            m.usd.ok = m.usd.value > 0;
+        }
+    }
+    doc.clear();
+    if (httpsGet("https://iboard-query.ssi.com.vn/exchange-index/VNINDEX?hasVN30=true", body) && !deserializeJson(doc, body)) {
+        JsonObject d = doc["data"];
+        m.vnindex.value = d["indexValue"] | 0.0;
+        m.vnindex.change = d["change"] | 0.0;
+        m.vnindex.changePct = d["changePercent"] | 0.0;
+        m.vnindex.ok = m.vnindex.value > 0;
+    }
+    doc.clear();
+    if (httpsGet("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd,vnd&include_24hr_change=true", body) &&
+        !deserializeJson(doc, body)) {
+        JsonObject b = doc["bitcoin"];
+        m.btc.value = b["usd"] | 0.0;
+        m.btc.value2 = b["vnd"] | 0.0;
+        m.btc.changePct = b["usd_24h_change"] | 0.0;
+        m.btc.ok = m.btc.value > 0;
+    }
+    m.fetchedMs = millis();
+    int okCount = m.goldBar.ok + m.usd.ok + m.vnindex.ok + m.btc.ok;
+    m.error = okCount ? "" : T("No connection", "Mất kết nối");
+    Serial.printf("Markets: gold %d usd %d vnindex %d btc %d\n", m.goldBar.ok, m.usd.ok, m.vnindex.ok, m.btc.ok);
+    markets = m;
+    marketsFetching = false;
+    marketsChanged = true;
+    vTaskDelete(nullptr);
+}
+
+void marketsRefresh() {
+    if (marketsFetching || WiFi.status() != WL_CONNECTED) return;
+    marketsFetching = true;
+    xTaskCreatePinnedToCore(marketsTask, "markets", 12288, nullptr, 1, nullptr, 1);
+}
+
+// A coloured pill with an up or down triangle; grey and flat when unchanged.
+void uiChangePill(int right, int y, double change, const String &text) {
+    bool up = change > 0, down = change < 0;
+    uint16_t fg = up ? UI_GREEN : down ? UI_RED : UI_SUB;
+    uint16_t bg = up ? rgb565(18, 56, 34) : down ? rgb565(66, 24, 24) : UI_LINE;
+    int w = aaWidth(ui12, text) + (up || down ? 26 : 16);
+    int x = right - w;
+    tft.fillRoundRect(x, y, w, 20, 10, bg);
+    if (up) tft.fillTriangle(x + 9, y + 13, x + 15, y + 13, x + 12, y + 7, fg);
+    if (down) tft.fillTriangle(x + 9, y + 7, x + 15, y + 7, x + 12, y + 13, fg);
+    uiBox(ui12, x + (up || down ? 19 : 8), y + 1, w - (up || down ? 26 : 16), 18, text, fg, bg);
+}
+
+const int MKT_CARD_H = 58;
+void marketCard(int i, const String &label, const Quote &q, const String &value, const String &sub, const String &pill, double dir) {
+    int y = CONTENT_Y + i * (MKT_CARD_H + 4);
+    tft.fillRoundRect(8, y, 224, MKT_CARD_H, 14, UI_CARD);
+    uiBox(ui12, 20, y + 6, 120, 18, label, UI_SUB, UI_CARD);
+    if (!q.ok) {
+        uiBox(ui15, 20, y + 26, 200, 24, "—", UI_SUB, UI_CARD);
+        return;
+    }
+    uiBox(ui20b, 20, y + 24, 132, 30, value, UI_TXT, UI_CARD);
+    uiBox(ui12, 112, y + 34, 108, 18, sub, UI_SUB, UI_CARD, AL_RIGHT);
+    if (pill.length()) uiChangePill(220, y + 6, dir, pill);
+}
+
+void marketsDraw() {
+    header(T("Markets", "Thị trường"));
+    if (!markets.fetchedMs) {
+        line(CONTENT_Y, marketsFetching ? T("Loading...", "Đang tải...") : markets.error, UI_SUB);
+        return;
+    }
+    bool vi = uiLang == LANG_VI;
+    const Markets &m = markets;
+    String unitTr = vi ? " tr" : "M";
+    marketCard(0, T("SJC gold · per tael", "Vàng SJC · lượng"), m.goldBar, fmtNum(m.goldBar.value / 1e6, 1) + unitTr,
+               T("Buy ", "Mua ") + fmtNum(m.goldBar.value2 / 1e6, 1),
+               m.goldBar.change ? (m.goldBar.change > 0 ? "+" : "") + fmtNum(m.goldBar.change / 1e6, 1) + unitTr : String(T("flat", "đứng")),
+               m.goldBar.change);
+    marketCard(1, T("USD · Vietcombank", "USD · Vietcombank"), m.usd, fmtNum(m.usd.value, 0),
+               T("Buy ", "Mua ") + fmtNum(m.usd.value2, 0), "", 0);
+    marketCard(2, "VN-Index", m.vnindex, fmtNum(m.vnindex.value, 2),
+               (m.vnindex.change > 0 ? "+" : "") + fmtNum(m.vnindex.change, 2),
+               (m.vnindex.changePct > 0 ? "+" : "") + fmtNum(m.vnindex.changePct, 2) + "%", m.vnindex.changePct);
+    marketCard(3, "Bitcoin", m.btc, "$" + fmtNum(m.btc.value, 0),
+               "~" + fmtNum(m.btc.value2 / 1e9, 2) + (vi ? " tỷ" : "B"),
+               (m.btc.changePct > 0 ? "+" : "") + fmtNum(m.btc.changePct, 2) + "%", m.btc.changePct);
+}
+
+void marketsEnter() {
+    if (!markets.fetchedMs || millis() - markets.fetchedMs > 5 * 60000UL) marketsRefresh();
+    marketsDraw();
+}
+void marketsTick() {
+    if (marketsChanged) {
+        marketsChanged = false;
+        marketsDraw();
+    }
+}
+void marketsPress() {
+    marketsRefresh();
+    line(H - 22, T("Refreshing...", "Đang cập nhật..."), UI_SUB, 1);
+}
+
+// ---------- LED from the internet ----------
+// The board keeps a connection open to ntfy.sh (a free pub/sub service over HTTP) on a secret
+// topic, so anyone with the topic can drive the LED from anywhere without opening the router:
+//   curl -d red https://ntfy.sh/<topic>        curl -d "#ff8800" ...    curl -d "blink blue" ...
+// Commands: a colour name (English or Vietnamese), #rrggbb, "r,g,b", off/tắt, "blink <colour>",
+// rainbow. The task only queues them; the loop drives the LED.
+QueueHandle_t remoteLedQueue;
+String remoteLedLast, remoteLedLastId;
+unsigned long remoteLedLastMs = 0;
+volatile bool remoteLedOnline = false;
+
+void remoteLedTask(void *) {
+    for (;;) {
+        if (WiFi.status() != WL_CONNECTED) {
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            continue;
+        }
+        WiFiClientSecure client;
+        client.setInsecure();
+        if (!client.connect("ntfy.sh", 443)) {
+            vTaskDelay(pdMS_TO_TICKS(10000));
+            continue;
+        }
+        // HTTP/1.0 so the stream comes without chunked encoding: one JSON object per line. After a
+        // reconnect, `since` asks for whatever was sent while the connection was down.
+        client.printf("GET /%s/json%s HTTP/1.0\r\nHost: ntfy.sh\r\nUser-Agent: esp32-device\r\n\r\n", NTFY_TOPIC,
+                      remoteLedLastId.length() ? ("?since=" + remoteLedLastId).c_str() : "");
+        client.setTimeout(2000);
+        bool body = false;
+        remoteLedOnline = true;
+        unsigned long lastDataMs = millis();
+        while (client.connected()) {
+            // Wait for data without spinning: this task shares core 0 with the idle task, and a
+            // busy loop here starves it and trips the task watchdog.
+            if (!client.available()) {
+                if (millis() - lastDataMs > 120000) break; // no keepalive (every ~45 s) for 2 minutes
+                vTaskDelay(pdMS_TO_TICKS(50));
+                continue;
+            }
+            lastDataMs = millis();
+            String ln = client.readStringUntil('\n');
+            ln.trim();
+            if (!body) {
+                if (ln.isEmpty()) body = true;
+                continue;
+            }
+            if (ln.isEmpty()) continue;
+            JsonDocument doc;
+            if (deserializeJson(doc, ln) || doc["event"] != "message") continue;
+            remoteLedLastId = (const char *)(doc["id"] | "");
+            char cmd[64];
+            strlcpy(cmd, doc["message"] | "", sizeof(cmd));
+            xQueueSend(remoteLedQueue, cmd, 0);
+        }
+        remoteLedOnline = false;
+        client.stop();
+        vTaskDelay(pdMS_TO_TICKS(3000));
+    }
+}
+
+bool parseColor(String c, uint8_t &r, uint8_t &g, uint8_t &b) {
+    c.trim();
+    c.toLowerCase();
+    struct Named { const char *name; uint8_t r, g, b; };
+    static const Named NAMES[] = {{"off", 0, 0, 0}, {"tắt", 0, 0, 0}, {"red", 255, 0, 0}, {"đỏ", 255, 0, 0},
+        {"orange", 255, 64, 0}, {"cam", 255, 64, 0}, {"yellow", 255, 176, 0}, {"vàng", 255, 176, 0},
+        {"green", 0, 255, 0}, {"xanh lá", 0, 255, 0}, {"cyan", 0, 255, 255}, {"xanh lơ", 0, 255, 255},
+        {"blue", 0, 0, 255}, {"xanh dương", 0, 0, 255}, {"xanh", 0, 0, 255}, {"purple", 128, 0, 255},
+        {"tím", 128, 0, 255}, {"pink", 255, 0, 96}, {"hồng", 255, 0, 96}, {"white", 255, 255, 255},
+        {"trắng", 255, 255, 255}, {"on", 255, 255, 255}, {"bật", 255, 255, 255}};
+    for (const Named &n : NAMES) {
+        if (c == n.name) {
+            r = n.r, g = n.g, b = n.b;
+            return true;
+        }
+    }
+    if (c.startsWith("#") && c.length() == 7) {
+        long v = strtol(c.c_str() + 1, nullptr, 16);
+        r = v >> 16, g = v >> 8, b = v;
+        return true;
+    }
+    int a1 = c.indexOf(','), a2 = c.indexOf(',', a1 + 1);
+    if (a1 > 0 && a2 > a1) {
+        r = constrain(c.substring(0, a1).toInt(), 0, 255);
+        g = constrain(c.substring(a1 + 1, a2).toInt(), 0, 255);
+        b = constrain(c.substring(a2 + 1).toInt(), 0, 255);
+        return true;
+    }
+    return false;
+}
+
+// Effects run from the loop: a few blinks, or a minute of rainbow; any new command replaces them.
+enum class LedFx { None, Blink, Rainbow };
+LedFx ledFx = LedFx::None;
+uint8_t ledFxR, ledFxG, ledFxB;
+unsigned long ledFxStartMs = 0;
+
+void remoteLedService() {
+    char cmd[64];
+    if (remoteLedQueue && xQueueReceive(remoteLedQueue, cmd, 0) == pdTRUE) {
+        String c = cmd;
+        c.trim();
+        String lower = c;
+        lower.toLowerCase();
+        uint8_t r, g, b;
+        bool ok = true;
+        if (lower == "rainbow" || lower == "cầu vồng") {
+            ledFx = LedFx::Rainbow;
+            ledFxStartMs = millis();
+        } else if ((lower.startsWith("blink ") || lower.startsWith("nháy ")) && parseColor(c.substring(c.indexOf(' ') + 1), r, g, b)) {
+            ledFx = LedFx::Blink;
+            ledFxR = r, ledFxG = g, ledFxB = b;
+            ledFxStartMs = millis();
+        } else if (parseColor(c, r, g, b)) {
+            ledFx = LedFx::None;
+            setLed(r, g, b);
+        } else {
+            ok = false;
+        }
+        remoteLedLast = c + (ok ? "" : " ?");
+        remoteLedLastMs = millis();
+        Serial.printf("Remote LED: \"%s\"%s\n", cmd, ok ? "" : " (not understood)");
+    }
+    unsigned long t = millis() - ledFxStartMs;
+    if (ledFx == LedFx::Blink) {
+        if (t > 4000) {
+            ledFx = LedFx::None;
+            setLed(0, 0, 0);
+        } else {
+            bool on = (t / 250) % 2 == 0;
+            if ((ledNow[0] || ledNow[1] || ledNow[2]) != on) setLed(on ? ledFxR : 0, on ? ledFxG : 0, on ? ledFxB : 0);
+        }
+    } else if (ledFx == LedFx::Rainbow) {
+        static unsigned long lastMs = 0;
+        if (t > 60000) {
+            ledFx = LedFx::None;
+            setLed(0, 0, 0);
+        } else if (millis() - lastMs > 30) {
+            lastMs = millis();
+            float h = fmodf(t / 3000.0f, 1.0f) * 6;
+            int i = (int)h;
+            float f = h - i;
+            uint8_t q = 255 * (1 - f), u = 255 * f;
+            uint8_t rgbv[6][3] = {{255, u, 0}, {q, 255, 0}, {0, 255, u}, {0, q, 255}, {u, 0, 255}, {255, 0, q}};
+            setLed(rgbv[i][0], rgbv[i][1], rgbv[i][2]);
+        }
+    }
+}
+
+void remoteLedBegin() {
+    if (!strlen(NTFY_TOPIC)) return;
+    remoteLedQueue = xQueueCreate(8, 64);
+    xTaskCreatePinnedToCore(remoteLedTask, "ntfy", 8192, nullptr, 1, nullptr, 0);
 }
 
 // ---------- navigate ----------
@@ -1816,23 +2874,21 @@ String formatDistance(double m) {
     return String(m / 1000.0, m < 10000 ? 1 : 0) + " km";
 }
 
-const int NAV_CX = 120, NAV_CY = 130, NAV_R = 58;
+const int NAV_CX = 120, NAV_CY = 150, NAV_R = 50;
 
 void navDraw() {
     if (!nav.hasDest) {
-        line(60, "No destination", ST77XX_WHITE, 2);
+        line(CONTENT_Y, T("No destination", "Chưa có điểm đến"), UI_SUB);
         return;
     }
-    String name = nav.destName.length() ? asciiFold(nav.destName) : String("Destination");
-    if (name.length() > 19) name = name.substring(0, 19);
-    while (name.length() < 19) name += ' ';
-    line(32, name, ST77XX_CYAN, 2);
+    String name = nav.destName.length() ? nav.destName : String(T("Destination", "Điểm đến"));
+    uiBox(ui15b, 14, CONTENT_Y - 2, W - 28, 24, name, ACCENT, UI_BG);
 
     unsigned long ageS = nav.hasFix ? (millis() - nav.fixMs) / 1000 : 0;
-    tft.fillCircle(NAV_CX, NAV_CY, NAV_R + 4, ST77XX_BLACK);
-    tft.drawCircle(NAV_CX, NAV_CY, NAV_R + 4, tft.color565(60, 60, 70));
+    tft.fillCircle(NAV_CX, NAV_CY, NAV_R + 6, UI_CARD);
     if (!nav.hasFix) {
-        line(200, "Waiting for GPS     ", ST77XX_YELLOW, 2);
+        uiBox(ui15, 0, 220, W, 24, T("Waiting for GPS", "Đang chờ GPS"), UI_YELLOW, UI_BG, AL_CENTER);
+        tft.fillRect(0, 248, W, 60, UI_BG);
         return;
     }
     double dist = distanceM(nav.lat, nav.lon, nav.destLat, nav.destLon);
@@ -1842,35 +2898,22 @@ void navDraw() {
     // standing still there is none, so the arrow is drawn north-up and says so.
     bool headingUp = nav.course >= 0 && nav.speedKmh >= 2;
     float angle = headingUp ? toDest - nav.course : toDest;
-    drawArrow(NAV_CX, NAV_CY, NAV_R - 6, angle, arrived ? ST77XX_GREEN : ST77XX_WHITE);
-    if (!headingUp) {
-        tft.setTextSize(1);
-        tft.setTextColor(ST77XX_RED, ST77XX_BLACK);
-        tft.setCursor(NAV_CX - 3, NAV_CY - NAV_R - 2);
-        tft.print("N");
-    }
+    drawArrow(NAV_CX, NAV_CY, NAV_R - 8, angle, arrived ? UI_GREEN : UI_TXT);
+    if (!headingUp) uiBox(ui12, NAV_CX - 8, NAV_CY - NAV_R - 2, 16, 14, "N", UI_RED, UI_CARD, AL_CENTER);
 
-    String d = arrived ? String("Arrived") : formatDistance(dist);
-    while (d.length() < 9) d += ' ';
-    tft.setTextSize(3);
-    tft.setTextColor(arrived ? ST77XX_GREEN : ST77XX_WHITE, ST77XX_BLACK);
-    tft.setCursor(8, 200);
-    tft.print(d);
+    if (arrived) uiBox(ui20b, 0, 214, W, 40, T("Arrived", "Đã đến"), UI_GREEN, UI_BG, AL_CENTER);
+    else uiBox(num34, 0, 214, W, 40, formatDistance(dist), UI_TXT, UI_BG, AL_CENTER);
 
     String speed = nav.speedKmh >= 0 ? String((int)lround(nav.speedKmh)) + " km/h" : String("-- km/h");
-    String eta = !arrived && nav.speedKmh >= 2 ? "  ~" + String((int)ceil(dist / 1000.0 / nav.speedKmh * 60)) + " min"
+    String eta = !arrived && nav.speedKmh >= 2 ? "  ·  ~" + String((int)ceil(dist / 1000.0 / nav.speedKmh * 60)) + T(" min", " phút")
                                               : String("");
-    String info = speed + eta;
-    while (info.length() < 19) info += ' ';
-    line(240, info, ST77XX_WHITE, 2);
-
-    String gps = ageS <= 15 ? "GPS " + String(ageS) + "s ago" : "GPS lost " + String(ageS) + "s";
-    while (gps.length() < 19) gps += ' ';
-    line(270, gps, ageS <= 15 ? tft.color565(120, 200, 120) : ST77XX_RED, 2);
+    uiBox(ui13b, 0, 256, W, 22, speed + eta, UI_TXT2, UI_BG, AL_CENTER);
+    String gps = ageS <= 15 ? "GPS · " + String(ageS) + T("s ago", " giây trước") : T("GPS lost · ", "Mất GPS · ") + String(ageS) + "s";
+    uiBox(ui12, 0, 282, W, 20, gps, ageS <= 15 ? UI_SUB : UI_RED, UI_BG, AL_CENTER);
 }
 
 void navEnter() {
-    header("Navigate");
+    header(T("Navigate", "Chỉ đường"));
     navDraw();
 }
 
@@ -1882,10 +2925,51 @@ void navTick() { // redraw once a second, and at once when a new fix or destinat
     navDraw();
 }
 
-enum Icon { ICON_TIMER, ICON_WEATHER, ICON_NAV, ICON_DOC, ICON_PHONE, ICON_WIFI, ICON_RGB, ICON_HOTSPOT, ICON_MIC, ICON_REC, ICON_ASK, ICON_INFO };
+// ---------- settings ----------
+// One setting so far, the screen language. The knob moves the highlight and a press applies it;
+// a press on the language already in use switches to the other one, so BOOT alone can change it.
+const char *LANG_NAMES[] = {"English", "Tiếng Việt"};
+int settingsSel = 0;
+
+// A list row like the menu's: a rounded highlight when selected, and a radio for the one in use.
+void settingsDraw() {
+    header(T("Settings", "Cài đặt"));
+    uiText(ui12, 14, CONTENT_Y - 4, T("LANGUAGE", "NGÔN NGỮ"), UI_SUB);
+    for (int i = 0; i < 2; i++) {
+        const int x = 8, y = CONTENT_Y + 20 + i * 44, w = 224, h = 40;
+        bool sel = i == settingsSel;
+        uint16_t bg = sel ? UI_CARD_SEL : UI_CARD;
+        tft.fillRoundRect(x, y, w, h, 12, bg);
+        tft.drawCircle(x + 22, y + h / 2, 8, i == uiLang ? ACCENT : UI_SUB);
+        if (i == uiLang) tft.fillCircle(x + 22, y + h / 2, 4, ACCENT);
+        uiBox(sel ? ui15b : ui15, x + 42, y + 8, 160, 24, LANG_NAMES[i], sel ? UI_TXT : UI_TXT2, bg);
+    }
+}
+void settingsEnter() {
+    settingsSel = uiLang;
+    settingsDraw();
+}
+void settingsRotate(int) {
+    settingsSel ^= 1;
+    settingsDraw();
+}
+void uiLangSet(uint8_t lang) {
+    uiLang = lang == LANG_VI ? LANG_VI : LANG_EN;
+    prefs.begin("ui", false);
+    prefs.putUChar("lang", uiLang);
+    prefs.end();
+    Serial.printf("Language: %s\n", LANG_NAMES[uiLang]);
+}
+void settingsPress() {
+    if (settingsSel == uiLang) settingsSel ^= 1;
+    uiLangSet(settingsSel);
+    settingsDraw();
+}
+
+enum Icon { ICON_TIMER, ICON_WEATHER, ICON_NAV, ICON_DOC, ICON_PHONE, ICON_WIFI, ICON_RGB, ICON_HOTSPOT, ICON_MIC, ICON_REC, ICON_ASK, ICON_SETTINGS, ICON_MARKET, ICON_BELL, ICON_INFO };
 
 struct App {
-    const char *name;
+    const char *name, *nameVi;
     Icon icon;
     void (*enter)();
     void (*tick)();
@@ -1893,155 +2977,193 @@ struct App {
 };
 // The clock is not listed: it is the home screen, shown at power-on and below the menu.
 const App APPS[] = {
-    {"Timer", ICON_TIMER, timerEnter, timerTick, timerPress},
-    {"Weather", ICON_WEATHER, weatherEnter, nullptr, weatherPress},
-    {"Navigate", ICON_NAV, navEnter, navTick, nullptr},
-    {"Documents", ICON_DOC, readerEnter, nullptr, readerPress},
-    {"From phone", ICON_PHONE, receiveEnter, nullptr, nullptr},
-    {"WiFi scan", ICON_WIFI, radarEnter, radarTick, radarPress},
-    {"RGB light", ICON_RGB, ledEnter, nullptr, ledPress},
-    {"Hotspot", ICON_HOTSPOT, hotspotEnter, hotspotTick, hotspotPress},
-    {"Sound meter", ICON_MIC, micEnter, micTick, micPress},
-    {"Recorder", ICON_REC, recEnter, recTick, recPress},
-    {"Ask AI", ICON_ASK, askEnter, askTick, askPress},
-    {"Info", ICON_INFO, infoEnter, infoTick, nullptr},
+    {"Ask AI", "Hỏi AI", ICON_ASK, askEnter, askTick, askPress},
+    {"Notifications", "Thông báo", ICON_BELL, notesEnter, notesTick, notesPress},
+    {"Timer", "Hẹn giờ", ICON_TIMER, timerEnter, timerTick, timerPress},
+    {"Weather", "Thời tiết", ICON_WEATHER, weatherEnter, nullptr, weatherPress},
+    {"Markets", "Thị trường", ICON_MARKET, marketsEnter, marketsTick, marketsPress},
+    {"Navigate", "Chỉ đường", ICON_NAV, navEnter, navTick, nullptr},
+    {"Documents", "Tài liệu", ICON_DOC, readerEnter, nullptr, readerPress},
+    {"From phone", "Từ điện thoại", ICON_PHONE, receiveEnter, nullptr, nullptr},
+    {"WiFi scan", "Quét WiFi", ICON_WIFI, radarEnter, radarTick, radarPress},
+    {"RGB light", "Đèn RGB", ICON_RGB, ledEnter, nullptr, ledPress},
+    {"Hotspot", "Phát WiFi", ICON_HOTSPOT, hotspotEnter, hotspotTick, hotspotPress},
+    {"Sound meter", "Đo âm thanh", ICON_MIC, micEnter, micTick, micPress},
+    {"Recorder", "Ghi âm", ICON_REC, recEnter, recTick, recPress},
+    {"Settings", "Cài đặt", ICON_SETTINGS, settingsEnter, nullptr, settingsPress},
+    {"Info", "Thông tin", ICON_INFO, infoEnter, infoTick, nullptr},
 };
 const int APP_COUNT = sizeof(APPS) / sizeof(APPS[0]);
-const int APP_TIMER = 0;
-const int APP_NAV = 2;
-const int APP_READER = 3;
-const int APP_RECEIVE = 4;
-const int APP_LED = 6;
-const int APP_HOTSPOT = 7;
-const int APP_REC = 9;
-const int APP_ASK = 10;
+// Indices looked up by entry function, so reordering the list never breaks them.
+int appIndexOf(void (*enter)()) {
+    for (int i = 0; i < APP_COUNT; i++) {
+        if (APPS[i].enter == enter) return i;
+    }
+    return -100;
+}
+const int APP_ASK = appIndexOf(askEnter);
+const int APP_TIMER = appIndexOf(timerEnter);
+const int APP_NAV = appIndexOf(navEnter);
+const int APP_READER = appIndexOf(readerEnter);
+const int APP_RECEIVE = appIndexOf(receiveEnter);
+const int APP_LED = appIndexOf(ledEnter);
+const int APP_HOTSPOT = appIndexOf(hotspotEnter);
+const int APP_REC = appIndexOf(recEnter);
+const int APP_SETTINGS = appIndexOf(settingsEnter);
+const int APP_NOTES = appIndexOf(notesEnter);
 const int HOME = -2; // appIndex value for the home clock (-1 is the menu)
 
 // Drawing text with a background color overwrites the old glyphs in place, so a row can be
 // refreshed without clearing it first - clearing is what makes the menu flicker.
 // Menu as a vertical list (it is scrolled with a knob, so one axis): each row is a card with an
 // icon drawn from shapes (no image assets) and the name. 7 rows fit; the list scrolls past that.
-const int ROW_X = 6, ROW_W = 224, ROW_H = 36, ROW_GAP = 5, ROW_TOP = 30, ROWS_VISIBLE = 7;
+const int ROW_X = 8, ROW_W = 222, ROW_H = 38, ROW_GAP = 4, ROW_TOP = CONTENT_Y, ROWS_VISIBLE = 6;
 int menuTop = 0; // first visible row
 
-void drawIcon(Icon icon, int cx, int cy) {
+// App icons: a white glyph on a rounded tile in the app's colour, like a phone's home screen.
+uint16_t iconColor(Icon icon) {
     switch (icon) {
-        case ICON_TIMER: { // stopwatch: dial, crown button and a hand
-            uint16_t c = tft.color565(255, 120, 80);
-            tft.drawCircle(cx, cy + 2, 11, c);
-            tft.drawCircle(cx, cy + 2, 10, c);
-            tft.fillRect(cx - 3, cy - 13, 7, 3, c);
-            tft.drawLine(cx, cy + 2, cx + 5, cy - 4, c);
-            tft.fillCircle(cx, cy + 2, 2, c);
+        case ICON_ASK: return rgb565(124, 92, 255);
+        case ICON_TIMER: return rgb565(255, 149, 0);
+        case ICON_WEATHER: return rgb565(10, 132, 255);
+        case ICON_NAV: return rgb565(48, 209, 88);
+        case ICON_DOC: return rgb565(255, 69, 58);
+        case ICON_PHONE: return rgb565(50, 173, 230);
+        case ICON_WIFI: return rgb565(94, 92, 230);
+        case ICON_RGB: return rgb565(58, 63, 75);
+        case ICON_HOTSPOT: return rgb565(52, 199, 89);
+        case ICON_MIC: return rgb565(255, 45, 85);
+        case ICON_REC: return rgb565(255, 55, 95);
+        case ICON_SETTINGS: return rgb565(142, 142, 147);
+        case ICON_MARKET: return rgb565(255, 179, 0);
+        case ICON_BELL: return rgb565(255, 59, 48);
+        default: return rgb565(99, 120, 160);
+    }
+}
+
+void drawIcon(Icon icon, int cx, int cy) {
+    const uint16_t c = UI_TXT, tile = iconColor(icon);
+    tft.fillRoundRect(cx - 15, cy - 15, 30, 30, 8, tile);
+    switch (icon) {
+        case ICON_ASK: // a four-point sparkle
+            tft.fillTriangle(cx, cy - 10, cx - 3, cy, cx + 3, cy, c);
+            tft.fillTriangle(cx, cy + 10, cx - 3, cy, cx + 3, cy, c);
+            tft.fillTriangle(cx - 10, cy, cx, cy - 3, cx, cy + 3, c);
+            tft.fillTriangle(cx + 10, cy, cx, cy - 3, cx, cy + 3, c);
             break;
-        }
-        case ICON_WEATHER: {
-            drawSun(cx - 5, cy - 5, 1);
-            drawCloud(cx + 4, cy + 4, 1, tft.color565(200, 200, 210));
+        case ICON_TIMER: // stopwatch
+            tft.drawCircle(cx, cy + 2, 8, c);
+            tft.drawCircle(cx, cy + 2, 7, c);
+            tft.fillRect(cx - 3, cy - 10, 7, 2, c);
+            tft.drawFastVLine(cx, cy - 3, 6, c);
+            tft.drawFastVLine(cx + 1, cy - 3, 6, c);
             break;
-        }
-        case ICON_NAV: // navigate: a navigation arrow tilted like a map pointer
-            drawArrow(cx, cy, 13, 45, tft.color565(80, 200, 255));
+        case ICON_WEATHER: // sun behind a cloud
+            tft.fillCircle(cx - 4, cy - 4, 5, rgb565(255, 214, 10));
+            tft.fillCircle(cx - 4, cy + 3, 5, c);
+            tft.fillCircle(cx + 3, cy, 6, c);
+            tft.fillRoundRect(cx - 9, cy + 2, 19, 7, 3, c);
             break;
-        case ICON_DOC: { // documents: a page with text lines
-            uint16_t c = ST77XX_WHITE;
-            tft.drawRect(cx - 10, cy - 13, 20, 26, c);
-            for (int i = 0; i < 4; i++) tft.drawFastHLine(cx - 6, cy - 7 + i * 5, 12, c);
+        case ICON_NAV: // a location arrow
+            drawArrow(cx, cy, 10, 45, c);
             break;
-        }
-        case ICON_PHONE: { // from phone: a phone with an arrow coming in
-            uint16_t c = ST77XX_CYAN;
-            tft.drawRoundRect(cx - 9, cy - 14, 18, 28, 3, c);
-            tft.drawFastHLine(cx - 3, cy + 10, 6, c);
-            tft.drawFastVLine(cx, cy - 9, 9, c);
-            tft.fillTriangle(cx, cy + 5, cx - 5, cy - 1, cx + 5, cy - 1, c);
+        case ICON_DOC: // a page with lines
+            tft.drawRoundRect(cx - 7, cy - 9, 14, 18, 2, c);
+            tft.drawRoundRect(cx - 6, cy - 8, 12, 16, 2, c);
+            for (int i = 0; i < 3; i++) tft.drawFastHLine(cx - 3, cy - 3 + i * 4, 7, c);
             break;
-        }
-        case ICON_WIFI: { // wifi scan: signal arcs
-            uint16_t c = ST77XX_GREEN;
-            for (int r = 5; r <= 15; r += 5) {
-                tft.drawCircleHelper(cx, cy + 9, r, 0x1 | 0x2, c); // top half of a circle
-                tft.drawCircleHelper(cx, cy + 9, r + 1, 0x1 | 0x2, c);
+        case ICON_PHONE: // a phone with an arrow coming in
+            tft.drawRoundRect(cx - 6, cy - 10, 12, 20, 3, c);
+            tft.drawRoundRect(cx - 5, cy - 9, 10, 18, 2, c);
+            tft.fillCircle(cx, cy + 6, 1, c);
+            tft.fillTriangle(cx, cy + 1, cx - 3, cy - 3, cx + 3, cy - 3, c);
+            tft.fillRect(cx - 1, cy - 7, 3, 5, c);
+            break;
+        case ICON_WIFI: // signal arcs
+            for (int r = 4; r <= 12; r += 4) {
+                tft.drawCircleHelper(cx, cy + 6, r, 0x1 | 0x2, c);
+                tft.drawCircleHelper(cx, cy + 6, r + 1, 0x1 | 0x2, c);
             }
+            tft.fillCircle(cx, cy + 6, 2, c);
+            break;
+        case ICON_RGB: // three colour dots
+            tft.fillCircle(cx - 5, cy - 3, 5, rgb565(255, 69, 58));
+            tft.fillCircle(cx + 5, cy - 3, 5, rgb565(48, 209, 88));
+            tft.fillCircle(cx, cy + 5, 5, rgb565(10, 132, 255));
+            break;
+        case ICON_HOTSPOT: // a mast broadcasting to both sides
+            tft.fillCircle(cx, cy - 3, 2, c);
+            tft.drawLine(cx, cy - 1, cx - 4, cy + 10, c);
+            tft.drawLine(cx, cy - 1, cx + 4, cy + 10, c);
+            tft.drawCircleHelper(cx, cy - 3, 6, 0x1 | 0x8, c);
+            tft.drawCircleHelper(cx, cy - 3, 6, 0x2 | 0x4, c);
+            tft.drawCircleHelper(cx, cy - 3, 10, 0x1 | 0x8, c);
+            tft.drawCircleHelper(cx, cy - 3, 10, 0x2 | 0x4, c);
+            break;
+        case ICON_MIC: // a microphone
+            tft.fillRoundRect(cx - 3, cy - 10, 7, 12, 3, c);
+            tft.drawCircleHelper(cx, cy - 1, 7, 0x4 | 0x8, c);
+            tft.drawFastVLine(cx, cy + 6, 4, c);
+            tft.drawFastHLine(cx - 4, cy + 10, 9, c);
+            break;
+        case ICON_REC: // a record button
+            tft.drawCircle(cx, cy, 9, c);
+            tft.fillCircle(cx, cy, 6, c);
+            break;
+        case ICON_SETTINGS: // a gear
+            for (int k = 0; k < 8; k++) {
+                float a = k * PI / 4;
+                tft.fillCircle(cx + (int)lroundf(8 * cosf(a)), cy + (int)lroundf(8 * sinf(a)), 2, c);
+            }
+            tft.fillCircle(cx, cy, 7, c);
+            tft.fillCircle(cx, cy, 3, tile);
+            break;
+        case ICON_BELL: // a bell
+            tft.fillCircle(cx, cy - 2, 7, c);
+            tft.fillRect(cx - 7, cy - 2, 15, 7, c);
+            tft.fillRoundRect(cx - 10, cy + 4, 21, 3, 1, c);
             tft.fillCircle(cx, cy + 9, 2, c);
+            tft.fillCircle(cx, cy - 10, 1, c);
             break;
-        }
-        case ICON_RGB: // rgb light: three overlapping colour dots
-            tft.fillCircle(cx - 6, cy - 4, 7, ST77XX_RED);
-            tft.fillCircle(cx + 6, cy - 4, 7, ST77XX_GREEN);
-            tft.fillCircle(cx, cy + 6, 7, ST77XX_BLUE);
+        case ICON_MARKET: // a rising chart line
+            tft.drawLine(cx - 9, cy + 6, cx - 3, cy - 1, c);
+            tft.drawLine(cx - 9, cy + 7, cx - 3, cy, c);
+            tft.drawLine(cx - 3, cy - 1, cx + 1, cy + 3, c);
+            tft.drawLine(cx - 3, cy, cx + 1, cy + 4, c);
+            tft.drawLine(cx + 1, cy + 3, cx + 9, cy - 6, c);
+            tft.drawLine(cx + 1, cy + 4, cx + 9, cy - 5, c);
+            tft.fillTriangle(cx + 10, cy - 8, cx + 4, cy - 7, cx + 9, cy - 2, c);
             break;
-        case ICON_HOTSPOT: { // hotspot: a mast broadcasting to both sides
-            uint16_t c = tft.color565(255, 140, 0);
-            tft.fillCircle(cx, cy - 5, 3, c);
-            tft.drawLine(cx, cy - 3, cx - 6, cy + 13, c);
-            tft.drawLine(cx, cy - 3, cx + 6, cy + 13, c);
-            tft.drawCircleHelper(cx, cy - 5, 8, 0x1 | 0x8, c);  // left half
-            tft.drawCircleHelper(cx, cy - 5, 8, 0x2 | 0x4, c);  // right half
-            tft.drawCircleHelper(cx, cy - 5, 12, 0x1 | 0x8, c);
-            tft.drawCircleHelper(cx, cy - 5, 12, 0x2 | 0x4, c);
+        case ICON_INFO: // an "i"
+            tft.fillCircle(cx, cy - 6, 2, c);
+            tft.fillRoundRect(cx - 1, cy - 2, 3, 10, 1, c);
             break;
-        }
-        case ICON_MIC: { // sound meter: a microphone on a stand
-            uint16_t c = tft.color565(255, 90, 160);
-            tft.fillRoundRect(cx - 5, cy - 14, 10, 17, 5, c);
-            tft.drawCircleHelper(cx, cy - 3, 9, 0x4 | 0x8, c); // bottom half: the holder
-            tft.drawCircleHelper(cx, cy - 3, 10, 0x4 | 0x8, c);
-            tft.fillRect(cx - 1, cy + 7, 3, 6, c);
-            tft.fillRect(cx - 6, cy + 12, 13, 2, c);
-            break;
-        }
-        case ICON_REC: // recorder: a record button
-            tft.drawCircle(cx, cy, 13, ST77XX_WHITE);
-            tft.fillCircle(cx, cy, 9, ST77XX_RED);
-            break;
-        case ICON_ASK: { // ask AI: a speech bubble with sparkle dots
-            uint16_t c = tft.color565(170, 120, 255);
-            tft.fillRoundRect(cx - 14, cy - 11, 28, 19, 6, c);
-            tft.fillTriangle(cx - 8, cy + 7, cx - 2, cy + 7, cx - 10, cy + 13, c);
-            for (int d = -7; d <= 7; d += 7) tft.fillCircle(cx + d, cy - 2, 2, ST77XX_WHITE);
-            break;
-        }
-        case ICON_INFO: { // info: an "i" in a circle
-            uint16_t c = tft.color565(120, 180, 255);
-            tft.drawCircle(cx, cy, 13, c);
-            tft.drawCircle(cx, cy, 12, c);
-            tft.fillRect(cx - 1, cy - 8, 3, 3, c);
-            tft.fillRect(cx - 1, cy - 3, 3, 11, c);
-            break;
-        }
     }
 }
 
 // One row, painted over its own area, so switching the selection repaints two rows only.
 void drawMenuItem(int i) {
     if (i < menuTop || i >= menuTop + ROWS_VISIBLE) return; // scrolled out of view
-    int x = ROW_X, y = ROW_TOP + (i - menuTop) * (ROW_H + ROW_GAP);
+    int y = ROW_TOP + (i - menuTop) * (ROW_H + ROW_GAP);
     bool sel = i == menuSel;
-    uint16_t bg = sel ? tft.color565(22, 52, 72) : tft.color565(32, 32, 38);
-    tft.fillRoundRect(x, y, ROW_W, ROW_H, 7, bg);
-    if (sel) {
-        tft.drawRoundRect(x, y, ROW_W, ROW_H, 7, ACCENT);
-        tft.drawRoundRect(x + 1, y + 1, ROW_W - 2, ROW_H - 2, 6, ACCENT);
-    }
-    drawIcon(APPS[i].icon, x + 24, y + ROW_H / 2);
-    tft.setTextSize(2);
-    tft.setTextColor(sel ? ACCENT : ST77XX_WHITE, bg);
-    tft.setCursor(x + 50, y + (ROW_H - 16) / 2);
-    tft.print(APPS[i].name);
+    uint16_t bg = sel ? UI_CARD_SEL : UI_BG;
+    tft.fillRoundRect(ROW_X, y, ROW_W, ROW_H, 12, bg);
+    drawIcon(APPS[i].icon, ROW_X + 23, y + ROW_H / 2);
+    uiBox(sel ? ui15b : ui15, ROW_X + 46, y + 8, 140, 22, T(APPS[i].name, APPS[i].nameVi), sel ? UI_TXT : UI_TXT2, bg);
+    if (sel) uiBox(ui15, ROW_X + ROW_W - 22, y + 8, 14, 22, "›", UI_SUB, bg, AL_CENTER);
 }
 
 void drawScrollbar() { // thin bar on the right showing where the visible rows sit in the list
     if (APP_COUNT <= ROWS_VISIBLE) return;
-    const int top = ROW_TOP, h = ROWS_VISIBLE * (ROW_H + ROW_GAP) - ROW_GAP;
+    const int top = ROW_TOP + 4, h = ROWS_VISIBLE * (ROW_H + ROW_GAP) - ROW_GAP - 8;
     int thumbH = h * ROWS_VISIBLE / APP_COUNT;
     int thumbY = top + (h - thumbH) * menuTop / (APP_COUNT - ROWS_VISIBLE);
-    tft.fillRect(W - 5, top, 3, h, tft.color565(40, 40, 48));
-    tft.fillRect(W - 5, thumbY, 3, thumbH, tft.color565(150, 150, 160));
+    tft.fillRect(W - 7, top, 3, h, UI_BG);
+    tft.fillRoundRect(W - 7, thumbY, 3, thumbH, 1, rgb565(70, 76, 90));
 }
 
 void drawMenu() {
-    header("Menu");
+    header(T("Apps", "Ứng dụng"));
     for (int i = menuTop; i < menuTop + ROWS_VISIBLE && i < APP_COUNT; i++) drawMenuItem(i);
     drawScrollbar();
 }
@@ -2084,7 +3206,9 @@ void goHome() {
 // One step back, shared by the back button and a long BOOT press: a screen inside an app
 // (an open document, an active timer) is left first, then the app, then the menu.
 void goBack() {
-    if (appIndex == APP_READER && !readerInList) readerEnter();
+    if (appIndex == APP_ASK && (askState == AskState::Recording || askState == AskState::Thinking)) askCancel();
+    else if (appIndex == APP_NOTES && notesDetail) notesPress();
+    else if (appIndex == APP_READER && !readerInList) readerEnter();
     else if (appIndex == APP_TIMER && timerState != TimerState::Set) timerReset();
     else if (appIndex >= 0) backToMenu();
     else if (appIndex == -1) goHome();
@@ -2168,6 +3292,7 @@ void handlePageUpload() {
     }
 }
 
+void showBanner(const AncsNote &n);
 void setupWeb() {
     server.on("/", HTTP_GET, []() { server.send(200, "text/html; charset=utf-8", SCREEN_PAGE_HTML); });
     server.on("/clockbg", HTTP_GET, []() {
@@ -2446,10 +3571,10 @@ void setupWeb() {
         server.send(200, "text/plain", "ok");
     });
     server.on("/buttons", HTTP_GET, []() { // live pin levels (1 = released) and press counters
-        String json = String("{\"level\":{\"boot\":") + digitalRead(BUTTON) + ",\"knob\":" + digitalRead(ENC_SW) +
-            ",\"back\":" + digitalRead(BACK_BTN) + ",\"encA\":" + digitalRead(ENC_A) + ",\"encB\":" + digitalRead(ENC_B) +
-            "},\"taps\":{\"boot\":" + bootTaps + ",\"knob\":" + knobTaps + ",\"back\":" + backTaps +
-            ",\"rotations\":" + rotations + "},\"edges\":{\"encA\":" + encEdgesA + ",\"encB\":" + encEdgesB + "}}";
+        String json = String("{\"level\":{\"boot\":") + digitalRead(BUTTON) + ",\"ok\":" + digitalRead(BTN_OK) +
+            ",\"back\":" + digitalRead(BACK_BTN) + ",\"up\":" + digitalRead(BTN_UP) + ",\"down\":" + digitalRead(BTN_DOWN) +
+            "},\"taps\":{\"boot\":" + bootTaps + ",\"select\":" + knobTaps + ",\"back\":" + backTaps +
+            ",\"up\":" + upTaps + ",\"down\":" + downTaps + "}}";
         server.send(200, "application/json", json);
     });
     server.on("/rec", HTTP_GET, []() {
@@ -2505,20 +3630,58 @@ void setupWeb() {
     server.on("/ask", HTTP_GET, []() { // never returns the key itself
         static const char *STATES[] = {"idle", "recording", "thinking", "answer", "failed"};
         AskState st = askState;
-        server.send(200, "application/json", String("{\"hasKey\":") + (askKey().length() ? "true" : "false") +
-            ",\"model\":\"" + jsonEscape(askModel()) + "\",\"state\":\"" + STATES[(int)st] + "\"" +
+        AskProvider pv = askProvider();
+        String keys;
+        for (int i = 0; i < ASK_PROVIDER_COUNT; i++) {
+            keys += String(i ? "," : "") + "\"" + ASK_PROVIDER_IDS[i] + "\":" + (askKey((AskProvider)i).length() ? "true" : "false");
+        }
+        server.send(200, "application/json", String("{\"provider\":\"") + ASK_PROVIDER_IDS[pv] + "\",\"keys\":{" + keys + "}" +
+            ",\"hasKey\":" + (askKey(pv).length() ? "true" : "false") +
+            ",\"model\":\"" + jsonEscape(askModel(pv)) + "\",\"state\":\"" + STATES[(int)st] + "\"" +
             ",\"elapsedS\":" + String(st == AskState::Recording ? (millis() - recStartMs) / 1000 : st == AskState::Thinking ? (millis() - askSentMs) / 1000 : 0) +
             ",\"tookMs\":" + String(askTookMs) + ",\"lines\":" + String(askLines.size()) + ",\"scroll\":" + String(askScroll) +
             ",\"question\":\"" + jsonEscape(askQuestion) + "\",\"answer\":\"" + jsonEscape(askAnswer) +
             "\",\"error\":\"" + jsonEscape(askError) + "\"}");
     });
+    // provider=<id> picks the one in use; key/model, when given, are saved for that provider.
     server.on("/ask/key", HTTP_POST, []() {
-        prefs.begin("gemini", false);
+        AskProvider pv = askProvider();
+        if (server.hasArg("provider")) {
+            String id = server.arg("provider");
+            int found = -1;
+            for (int i = 0; i < ASK_PROVIDER_COUNT; i++) {
+                if (id == ASK_PROVIDER_IDS[i]) found = i;
+            }
+            if (found < 0) return server.send(400, "text/plain", "Nền tảng không hợp lệ");
+            pv = (AskProvider)found;
+            askSetProvider(pv);
+        }
+        prefs.begin(ASK_PROVIDER_IDS[pv], false);
         if (server.hasArg("key")) prefs.putString("key", server.arg("key"));
         if (server.hasArg("model")) prefs.putString("model", server.arg("model"));
         prefs.end();
-        if (appIndex == APP_ASK && askState == AskState::Idle) askDraw();
-        server.send(200, "text/plain", "Đã lưu");
+        if (appIndex == APP_ASK && (askState == AskState::Idle || askState == AskState::Failed)) {
+            askState = AskState::Idle;
+            askWasCancelled = false;
+            askShown = askState;
+            askDraw();
+        }
+        server.send(200, "text/plain", String("Đã lưu (") + ASK_PROVIDER_NAMES[pv] + ")");
+    });
+    server.on("/lang", HTTP_GET, []() { server.send(200, "text/plain", uiLang == LANG_VI ? "vi" : "en"); });
+    server.on("/lang", HTTP_POST, []() { // same as Settings on the device: lang=en|vi, redraws the current screen
+        String l = server.arg("lang");
+        if (l != "en" && l != "vi") return server.send(400, "text/plain", "lang=en|vi");
+        uiLangSet(l == "vi" ? LANG_VI : LANG_EN);
+        if (appIndex == HOME) goHome();
+        else if (appIndex < 0) drawMenu();
+        else openApp(appIndex);
+        server.send(200, "text/plain", l);
+    });
+    server.on("/ask/cancel", HTTP_POST, []() { // same as the back button while asking
+        bool active = askState == AskState::Recording || askState == AskState::Thinking;
+        if (active) askCancel();
+        server.send(200, "text/plain", active ? "Đã hủy" : "Không có câu hỏi nào đang chạy");
     });
     server.on("/ask/press", HTTP_POST, []() { // same as the knob: start, or stop and send
         if (appIndex != APP_ASK) openApp(APP_ASK);
@@ -2547,11 +3710,129 @@ void setupWeb() {
         }
         server.send(200, "application/json", json + "}");
     });
+    // Firmware update over WiFi: POST the .bin as multipart to /ota?key=<OTA_KEY> (tools/ota_upload.sh).
+    // It is written to the other app slot and the board boots it only if the whole image checks out.
+    server.on("/ota", HTTP_POST, []() {
+        if (otaError.length()) {
+            server.send(otaError == "bad key" ? 403 : 400, "text/plain", "OTA failed: " + otaError);
+            if (appIndex >= 0) openApp(appIndex);
+            else goHome();
+            return;
+        }
+        server.send(200, "text/plain", "OTA ok, " + String(otaBytes) + " bytes, restarting");
+        delay(300);
+        ESP.restart();
+    }, []() {
+        HTTPUpload &up = server.upload();
+        if (up.status == UPLOAD_FILE_START) {
+            otaError = "";
+            otaBytes = 0;
+            if (strlen(OTA_KEY) < 12 || !strcmp(OTA_KEY, "change-me") || server.arg("key") != OTA_KEY) {
+                otaError = "bad key";
+                return;
+            }
+            if (recording) recStop();
+            header(T("Updating", "Dang cap nhat"));
+            if (!Update.begin(UPDATE_SIZE_UNKNOWN)) otaError = Update.errorString();
+            Serial.println("OTA start");
+        } else if (up.status == UPLOAD_FILE_WRITE) {
+            if (otaError.length()) return;
+            if (Update.write(up.buf, up.currentSize) != up.currentSize) otaError = Update.errorString();
+            otaBytes += up.currentSize;
+            static size_t shown = 0;
+            if (otaBytes - shown >= 32768 || otaBytes < shown) {
+                shown = otaBytes;
+                line(CONTENT_Y, String(otaBytes / 1024) + " KB", UI_TXT, 3);
+            }
+        } else if (up.status == UPLOAD_FILE_END) {
+            if (!otaError.length() && !Update.end(true)) otaError = Update.errorString();
+            Serial.printf("OTA end: %u bytes %s\n", otaBytes, otaError.length() ? otaError.c_str() : "ok");
+        } else if (up.status == UPLOAD_FILE_ABORTED) {
+            Update.abort();
+            otaError = "aborted";
+        }
+    });
+    server.on("/led", HTTP_GET, []() { // the LED's colour and the remote control's state
+        char hex[8];
+        snprintf(hex, sizeof(hex), "#%02x%02x%02x", ledNow[0], ledNow[1], ledNow[2]);
+        server.send(200, "application/json", String("{\"color\":\"") + hex + "\",\"remoteOnline\":" +
+            (remoteLedOnline ? "true" : "false") + ",\"last\":\"" + jsonEscape(remoteLedLast) + "\",\"lastAgeS\":" +
+            String(remoteLedLastMs ? (long)((millis() - remoteLedLastMs) / 1000) : -1L) + "}");
+    });
+    server.on("/markets", HTTP_GET, []() {
+        const Markets &m = markets;
+        auto q = [](const char *name, const Quote &x) {
+            return String("\"") + name + "\":{\"ok\":" + (x.ok ? "true" : "false") + ",\"value\":" + String(x.value, 2) +
+                ",\"value2\":" + String(x.value2, 2) + ",\"change\":" + String(x.change, 2) + ",\"changePct\":" + String(x.changePct, 2) + "}";
+        };
+        server.send(200, "application/json", String("{\"fetching\":") + (marketsFetching ? "true" : "false") +
+            ",\"ageS\":" + String(m.fetchedMs ? (long)((millis() - m.fetchedMs) / 1000) : -1L) + "," +
+            q("goldBar", m.goldBar) + "," + q("goldRing", m.goldRing) + "," + q("goldWorld", m.goldWorld) + "," +
+            q("usd", m.usd) + "," + q("vnindex", m.vnindex) + "," + q("btc", m.btc) + "}");
+    });
+    server.on("/notifications", HTTP_GET, []() {
+        String json = String("{\"connected\":") + (ancs::connected ? "true" : "false") + ",\"encrypted\":" +
+            (ancs::encrypted ? "true" : "false") + ",\"ready\":" + (ancs::ready ? "true" : "false") +
+            ",\"bonds\":" + String(NimBLEDevice::getNumBonds()) + ",\"log\":\"" + jsonEscape(ancs::log) + "\",\"notes\":[";
+        for (size_t i = 0; i < notes.size(); i++) {
+            json += String(i ? "," : "") + "{\"app\":\"" + jsonEscape(notes[i].n.app) + "\",\"title\":\"" + jsonEscape(notes[i].n.title) +
+                "\",\"message\":\"" + jsonEscape(notes[i].n.message) + "\",\"category\":" + notes[i].n.category +
+                ",\"ageS\":" + String((millis() - notes[i].ms) / 1000) + "}";
+        }
+        server.send(200, "application/json", json + "]}");
+    });
+    server.on("/notifications/test", HTTP_POST, []() { // a fake notification, to check the banner and list
+        AncsNote n{0xFFFFFF00u + (uint32_t)notes.size(), 4, "com.vng.zalo", server.arg("title"), server.arg("message")};
+        notes.insert(notes.begin(), {n, millis()});
+        if (appIndex != APP_NOTES) showBanner(n);
+        else notesDraw();
+        server.send(200, "text/plain", "ok");
+    });
+    server.on("/screen", HTTP_GET, []() { // what the panel shows, as a 24-bit BMP (from the PSRAM mirror)
+        if (!tft.mirror) return server.send(503, "text/plain", "no mirror");
+        const uint32_t rowBytes = W * 3, size = 54 + rowBytes * H;
+        uint8_t hdr[54] = {'B', 'M'};
+        auto put32 = [&](int at, uint32_t v) { for (int i = 0; i < 4; i++) hdr[at + i] = v >> (8 * i); };
+        put32(2, size);
+        put32(10, 54);
+        put32(14, 40);
+        put32(18, W);
+        put32(22, H);
+        hdr[26] = 1;
+        hdr[28] = 24;
+        put32(34, rowBytes * H);
+        server.setContentLength(size);
+        server.send(200, "image/bmp", "");
+        server.sendContent((const char *)hdr, 54);
+        static uint8_t row[W * 3];
+        for (int y = H - 1; y >= 0; y--) { // BMP rows go bottom-up, pixels as B, G, R
+            for (int x = 0; x < W; x++) {
+                uint16_t c = tft.mirror[y * W + x];
+                row[x * 3] = (c & 31) << 3 | (c & 31) >> 2;
+                row[x * 3 + 1] = ((c >> 5) & 63) << 2 | ((c >> 5) & 63) >> 4;
+                row[x * 3 + 2] = (c >> 11) << 3 | (c >> 11) >> 2;
+            }
+            server.sendContent((const char *)row, sizeof(row));
+        }
+    });
+    server.on("/battery/calibrate", HTTP_POST, []() { // volts = the rail's true voltage right now
+        float volts = server.arg("volts").toFloat();
+        uint32_t mv = batteryPinMv();
+        if (volts < 2.8f || volts > 4.4f || mv < 500) return server.send(400, "text/plain", "volts=2.8..4.4");
+        batteryDivider = volts * 1000.0f / mv;
+        prefs.begin("battery", false);
+        prefs.putFloat("divider", batteryDivider);
+        prefs.end();
+        batterySmoothed = 0;
+        batteryRecentCount = 0;
+        server.send(200, "text/plain", "pin " + String(mv) + " mV, divider " + String(batteryDivider, 4));
+    });
     server.on("/battery", HTTP_GET, []() {
         float v = batteryVolts();
         server.send(200, "application/json", String("{\"present\":") + (batteryPresent(v) ? "true" : "false") +
             ",\"volts\":" + String(v, 2) + ",\"percent\":" + String(batteryPresent(v) ? batteryPercent(v) : 0) +
-            ",\"raw\":" + String(batteryVoltsRaw(), 2) + ",\"spread\":" + String(batterySpread(), 2) + "}");
+            ",\"raw\":" + String(batteryVoltsRaw(), 2) + ",\"spread\":" + String(batterySpread(), 2) + ",\"charging\":" + (batteryCharging ? "true" : "false") + ",\"pinMv\":" + String(batteryPinMv()) +
+            ",\"divider\":" + String(batteryDivider, 4) + "}");
     });
     server.on("/ap", HTTP_GET, []() {
         server.send(200, "application/json", String("{\"on\":") + (apOn ? "true" : "false") +
@@ -2586,31 +3867,7 @@ void setupWeb() {
     });
 }
 
-// ---------- rotary encoder ----------
-
-// Quadrature decoding: every transition of the two contacts scores +1, -1 or 0 (an
-// impossible jump), and one detent of an EC11 is four of them. Contact bounce shows up as
-// transitions that cancel out, so it is filtered by the arithmetic itself.
-const int8_t QUADRATURE[16] = {0, -1, 1, 0, 1, 0, 0, -1, -1, 0, 0, 1, 0, 1, -1, 0};
-volatile int8_t encSubStep = 0;
-volatile int8_t encSteps = 0;
-volatile uint8_t encPrev = 0;
-
-void IRAM_ATTR encoderIsr() {
-    uint8_t now = (digitalRead(ENC_A) << 1) | digitalRead(ENC_B);
-    if (now == encPrev) return;
-    if ((now ^ encPrev) & 2) encEdgesA++;
-    if ((now ^ encPrev) & 1) encEdgesB++;
-    encSubStep += QUADRATURE[(encPrev << 2) | now];
-    encPrev = now;
-    if (encSubStep >= 4) {
-        encSubStep = 0;
-        encSteps++;
-    } else if (encSubStep <= -4) {
-        encSubStep = 0;
-        encSteps--;
-    }
-}
+// ---------- moving (up / down buttons) ----------
 
 void onRotate(int dir) {
     if (appIndex == HOME) {
@@ -2624,32 +3881,17 @@ void onRotate(int dir) {
             stepPage(dir);
             return;
         }
-        if (docCacheN == 0) return;
-        int previous = readerAt;
-        readerAt = (readerAt + dir + docCacheN) % docCacheN;
-        readerDrawRow(previous); // only the two rows that changed, so scrolling stays instant
-        readerDrawRow(readerAt);
+        readerMove(dir);
     } else if (appIndex == APP_ASK) {
         askRotate(dir);
+    } else if (appIndex == APP_NOTES) {
+        notesRotate(dir);
+    } else if (appIndex == APP_SETTINGS) {
+        settingsRotate(dir);
     } else if (appIndex == APP_LED) {
         int count = sizeof(PRESETS) / sizeof(PRESETS[0]);
         presetIndex = (presetIndex + dir + count) % count;
         ledShow();
-    }
-}
-
-void encoderService() {
-    noInterrupts();
-    int8_t steps = encSteps;
-    encSteps = 0;
-    interrupts();
-    for (; steps > 0; steps--) {
-        rotations++;
-        onRotate(1);
-    }
-    for (; steps < 0; steps++) {
-        rotations++;
-        onRotate(-1);
     }
 }
 
@@ -2658,7 +3900,7 @@ void encoderService() {
 struct ButtonState {
     bool armed = false; // a button counts only after it has been seen released once
     bool down = false, longFired = false;
-    unsigned long pressedMs = 0;
+    unsigned long pressedMs = 0, lastStepMs = 0, releasedMs = 0;
 };
 
 
@@ -2694,7 +3936,57 @@ void serviceButton(bool now, bool tapSelects, bool holdActs, ButtonState &s) {
     }
 }
 
+// Select, the same thing a knob press used to do: open the menu from the clock, open the app
+// under the cursor, or the app's own action.
+void selectAction() {
+    knobTaps++;
+    if (appIndex == HOME) backToMenu();
+    else if (appIndex < 0) openApp(menuSel);
+    else if (APPS[appIndex].press) APPS[appIndex].press();
+}
+
+// Up / down buttons: a press moves one step at once; held, it keeps stepping like a key on a
+// keyboard, after a short pause and then faster. On the home clock a press opens the menu.
+const unsigned long NAV_REPEAT_DELAY_MS = 400, NAV_REPEAT_MS = 120, NAV_FAST_AFTER_MS = 1500, NAV_FAST_MS = 50;
+void navStep(int dir, bool first) {
+    dir > 0 ? downTaps++ : upTaps++;
+    if (appIndex == HOME) {
+        if (first) backToMenu();
+    } else {
+        onRotate(dir);
+    }
+}
+
+void serviceNavButton(bool now, int dir, ButtonState &s) {
+    if (!s.armed) {
+        if (!now) s.armed = true;
+        return;
+    }
+    unsigned long t = millis();
+    if (now && !s.down) {
+        if (t - s.releasedMs < 40) return; // contact bounce right after a release
+        s.down = true;
+        s.pressedMs = s.lastStepMs = t;
+        navStep(dir, true);
+    } else if (now && s.down) {
+        unsigned long held = t - s.pressedMs;
+        unsigned long every = held > NAV_FAST_AFTER_MS ? NAV_FAST_MS : NAV_REPEAT_MS;
+        if (held > NAV_REPEAT_DELAY_MS && t - s.lastStepMs >= every) {
+            s.lastStepMs = t;
+            navStep(dir, false);
+        }
+    } else if (!now && s.down) {
+        if (t - s.pressedMs < 30) return; // a press must last 30 ms before its release counts
+        s.down = false;
+        s.releasedMs = t;
+    }
+}
+
 void handleButton() {
+    static ButtonState up, down;
+    serviceNavButton(digitalRead(BTN_UP) == LOW, -1, up);
+    serviceNavButton(digitalRead(BTN_DOWN) == LOW, 1, down);
+
     static bool armed = false;
     static ButtonState boot, knob;
     bool bootDown = digitalRead(BUTTON) == LOW;
@@ -2703,7 +3995,7 @@ void handleButton() {
         bootDown = false;
     }
     serviceButton(bootDown, false, true, boot);
-    serviceButton(digitalRead(ENC_SW) == LOW, true, false, knob);
+    serviceButton(digitalRead(BTN_OK) == LOW, true, false, knob); // OK: a tap selects
 
     // Dedicated back button: a tap leaves the app, no need to hold anything.
     static ButtonState back;
@@ -2753,8 +4045,73 @@ void homeTimerLine() {
     long s = active ? (timerRemainingMs() + 999) / 1000 : -1;
     if (s == homeTimerShownSec) return;
     homeTimerShownSec = s;
-    String text = active ? "Timer " + timerText() + (timerState == TimerState::Paused ? " (paused)" : "") : "";
-    clockLine(CLOCK_TIMER_Y, text, tft.color565(255, 140, 0), 2, 19);
+    const int h = 28;
+    clockBgRestore(CLOCK_TIMER_Y, h);
+    if (!active) return;
+    String text = T("Timer  ", "Hẹn giờ  ") + timerText() + (timerState == TimerState::Paused ? T("  paused", "  tạm dừng") : "");
+    int w = aaWidth(ui13b, text) + 32;
+    const uint16_t pill = rgb565(58, 38, 10);
+    tft.fillRoundRect((W - w) / 2, CLOCK_TIMER_Y, w, h, h / 2, pill);
+    uiBox(ui13b, (W - w) / 2 + 14, CLOCK_TIMER_Y + 4, w - 28, h - 8, text, UI_ORANGE, pill, AL_CENTER);
+}
+
+// ---------- notification banner ----------
+// Puts back whatever the banner covered. Screens whose state an app re-entry would lose (an open
+// document, an answer being read, a phone image) are redrawn their own way or not covered at all.
+void restoreScreen() {
+    if (appIndex == HOME) goHome();
+    else if (appIndex < 0) drawMenu();
+    else if (appIndex == APP_READER && !readerInList) showStoredPage(currentPage);
+    else if (appIndex == APP_ASK && askState != AskState::Idle) askDraw();
+    else if (appIndex == APP_NOTES) notesDraw();
+    else openApp(appIndex);
+}
+
+void showBanner(const AncsNote &n) {
+    const int y = 4, h = 70;
+    uint16_t bg = UI_CARD_SEL;
+    tft.fillRoundRect(6, y, 228, h, 16, bg);
+    tft.drawRoundRect(6, y, 228, h, 16, UI_LINE);
+    drawIcon(n.category == 1 ? ICON_PHONE : ICON_BELL, 30, y + 22);
+    uiBox(ui12, 52, y + 4, 172, 21, appLabel(n.app), n.category == 1 ? UI_GREEN : ACCENT, bg);
+    uiBox(ui15b, 52, y + 22, 172, 23, oneLine(n.title), UI_TXT, bg);
+    uiBox(ui12, 18, y + 46, 206, 21, oneLine(n.message), UI_TXT2, bg);
+    bannerUntilMs = millis() + (n.category == 1 ? 10000 : 5000);
+}
+
+void notesService() {
+    AncsNote n;
+    while (ancs::take(n)) {
+        Serial.printf("Notification: %s | %s | %s\n", n.app.c_str(), n.title.c_str(), n.message.c_str());
+        notes.insert(notes.begin(), {n, millis()});
+        if (notes.size() > 20) notes.pop_back();
+        if (appIndex == APP_NOTES && !notesDetail) {
+            notesSel = 0;
+            notesTop = 0;
+            notesDraw();
+        } else {
+            unreadNotes++;
+            bool covered = appIndex == APP_RECEIVE || otaBytes || (appIndex == APP_ASK && askState == AskState::Recording);
+            if (!covered) showBanner(n);
+        }
+    }
+    uint32_t uid;
+    while (ancs::takeRemoved(uid)) { // dismissed on the phone: drop it here too
+        for (size_t i = 0; i < notes.size(); i++) {
+            if (notes[i].n.uid == uid) {
+                notes.erase(notes.begin() + i);
+                if (appIndex == APP_NOTES && !notesDetail) {
+                    notesSel = constrain(notesSel, 0, max(0, (int)notes.size() - 1));
+                    notesDraw();
+                }
+                break;
+            }
+        }
+    }
+    if (bannerUntilMs && (long)(millis() - bannerUntilMs) >= 0) {
+        bannerUntilMs = 0;
+        restoreScreen();
+    }
 }
 
 // ---------- boot log ----------
@@ -2829,24 +4186,25 @@ void setup() {
     Serial.begin(115200);
     bootLogStart();
     pinMode(BUTTON, INPUT_PULLUP);
-    pinMode(ENC_A, INPUT_PULLUP);
-    pinMode(ENC_B, INPUT_PULLUP);
-    pinMode(ENC_SW, INPUT_PULLUP);
+    pinMode(BTN_UP, INPUT_PULLUP);
+    pinMode(BTN_DOWN, INPUT_PULLUP);
+    pinMode(BTN_OK, INPUT_PULLUP);
     pinMode(BACK_BTN, INPUT_PULLUP);
-    encPrev = (digitalRead(ENC_A) << 1) | digitalRead(ENC_B);
-    attachInterrupt(ENC_A, encoderIsr, CHANGE);
-    attachInterrupt(ENC_B, encoderIsr, CHANGE);
     initLed();
     setLed(0, 0, 0);
     micBegin();
     recBegin();
+    batteryBegin();
 
     // On a plain charger the board starts the instant power appears, whereas a computer's USB
     // enumeration delays it. Give the 3.3 V rail time to settle before initialising the panel,
     // otherwise it comes up blank and stays blank.
     delay(300);
+    prefs.begin("ui", true);
+    uiLang = prefs.getUChar("lang", LANG_EN) == LANG_VI ? LANG_VI : LANG_EN;
+    prefs.end();
     screenInit();
-    header("Starting...");
+    header(T("Starting...", "Đang khởi động..."));
     bootLogStage(BOOT_SCREEN);
 
     // Mount without the format-on-failure flag first: formatting wipes every stored document,
@@ -2871,7 +4229,7 @@ void setup() {
     WiFi.mode(WIFI_STA);
     WiFi.setHostname(HOSTNAME);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    line(50, "Connecting WiFi...");
+    line(CONTENT_Y, T("Connecting WiFi...", "Đang kết nối WiFi..."), UI_SUB);
     for (int i = 0; i < 60 && WiFi.status() != WL_CONNECTED; i++) delay(250);
     bootLogStage(WiFi.status() == WL_CONNECTED ? BOOT_WIFI_OK : BOOT_WIFI_FAIL);
     if (WiFi.status() == WL_CONNECTED) {
@@ -2892,6 +4250,8 @@ void setup() {
     if (apWanted) apStart(); // the board keeps broadcasting across reboots if it was left on
 
     setupWeb();
+    remoteLedBegin();
+    ancs::begin(BLE_NAME);
     server.on("/boots", HTTP_GET, []() {
         String out;
         for (int i = 0; i < BOOT_LOG_N && bootLog[i].seq; i++) {
@@ -2912,7 +4272,6 @@ void setup() {
 void loop() {
     if (apOn) dns.processNextRequest();
     server.handleClient();
-    encoderService();
     handleButton();
     if (appIndex >= 0 && APPS[appIndex].tick) APPS[appIndex].tick();
     if (appIndex == HOME) {
@@ -2921,6 +4280,8 @@ void loop() {
     }
     timerService();
     bootLogTick();
+    remoteLedService();
+    notesService();
     // A recording ends when its screen is left, or before it fills the storage.
     static unsigned long lastRecCheckMs = 0;
     if (recording && millis() - lastRecCheckMs > 1000) {
@@ -2936,10 +4297,11 @@ void loop() {
         lastSampleMs = millis();
         batteryUpdate();
     }
-    // Refresh the battery indicator, but not while a document page or a phone image covers
-    // the title bar.
-    if (millis() - lastBatteryMs > 15000) {
+    // Keep the status bar's time and battery current, but not while a document page or a phone
+    // image covers the top of the screen.
+    if (millis() - lastBatteryMs > 2000) {
         lastBatteryMs = millis();
-        if (appIndex != HOME && appIndex != APP_READER && appIndex != APP_RECEIVE) drawBatteryIcon();
+        bool covered = appIndex == HOME || appIndex == APP_RECEIVE || (appIndex == APP_READER && !readerInList) || otaBytes;
+        if (!covered && statusKey() != statusShownKey) uiStatusBar();
     }
 }

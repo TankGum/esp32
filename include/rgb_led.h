@@ -13,7 +13,12 @@ static void initLed() {
     }
 }
 
+static uint8_t ledNow[3]; // the colour last sent, so it can be reported
+
 static void setLed(uint8_t r, uint8_t g, uint8_t b) {
+    ledNow[0] = r;
+    ledNow[1] = g;
+    ledNow[2] = b;
     rmt_data_t data[24];
     uint8_t color[3] = {g, r, b}; // WS2812 expects GRB order
     int i = 0;
