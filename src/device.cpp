@@ -2966,7 +2966,109 @@ void settingsPress() {
     settingsDraw();
 }
 
-enum Icon { ICON_TIMER, ICON_WEATHER, ICON_NAV, ICON_DOC, ICON_PHONE, ICON_WIFI, ICON_RGB, ICON_HOTSPOT, ICON_MIC, ICON_REC, ICON_ASK, ICON_SETTINGS, ICON_MARKET, ICON_BELL, ICON_INFO };
+// ---------- nRF24 Jammer ----------
+// NRF24L01+ module on SPI: CE=GPIO10, CSN=GPIO9, SCK=GPIO12, MOSI=GPIO11, MISO=GPIO13
+// Bluetooth jamming with 3 methods: List, Random, Bruteforce
+#include <SPI.h>
+#include <nRF24L01.h>
+#include <RF24.h>
+
+#define NRF24_CE  10
+#define NRF24_CSN 9
+
+RF24 radio(NRF24_CE, NRF24_CSN);
+bool nrf24Active = false;
+bool nrf24Running = false;
+uint8_t nrf24Channel = 0;
+uint8_t nrf24Method = 0; // 0=List, 1=Random, 2=Bruteforce
+
+// Bluetooth channels from nrf24_jammer.c
+const uint8_t btChannels[] = {32, 34, 46, 48, 50, 52, 0, 1, 2, 4, 6, 8, 22, 24, 26, 28, 30, 74, 76, 78, 80};
+const int btChannelsCount = sizeof(btChannels) / sizeof(btChannels[0]);
+
+void nrf24JamList() {
+    static int idx = 0;
+    nrf24Channel = btChannels[idx];
+    radio.stopConstCarrier();
+    radio.setChannel(nrf24Channel);
+    radio.startConstCarrier(RF24_PA_MAX, nrf24Channel);
+    idx = (idx + 1) % btChannelsCount;
+}
+
+void nrf24JamRandom() {
+    nrf24Channel = random(0, 81);
+    radio.stopConstCarrier();
+    radio.setChannel(nrf24Channel);
+    radio.startConstCarrier(RF24_PA_MAX, nrf24Channel);
+}
+
+void nrf24JamBruteforce() {
+    static uint8_t ch = 0;
+    nrf24Channel = ch;
+    radio.stopConstCarrier();
+    radio.setChannel(nrf24Channel);
+    radio.startConstCarrier(RF24_PA_MAX, nrf24Channel);
+    ch = (ch + 1) % 81;
+}
+
+void nrf24Enter() {
+    header(T("nRF24 Jammer", "nRF24 Jammer"));
+    if (!nrf24Active) {
+        if (radio.begin()) {
+            nrf24Active = true;
+            radio.setPALevel(RF24_PA_MAX);
+            radio.setDataRate(RF24_2MBPS);
+            radio.setChannel(0);
+            radio.stopListening();
+            line(CONTENT_Y, T("Module found", "Tìm thấy module"), UI_GREEN);
+        } else {
+            line(CONTENT_Y, T("No module found", "Không tìm thấy module"), UI_RED);
+            line(CONTENT_Y + 26, T("Check wiring", "Kiểm tra dây nối"), UI_SUB);
+            return;
+        }
+    }
+    line(CONTENT_Y + 26, T("Press OK to start/stop", "Nhấn OK để bắt đầu/dừng"), UI_SUB);
+    line(CONTENT_Y + 52, String(T("Method: ", "Phương pháp: ")) + (nrf24Method == 0 ? T("List", "Danh sách") : nrf24Method == 1 ? T("Random", "Ngẫu nhiên") : T("Bruteforce", "Vét cạn")), UI_TXT);
+    if (nrf24Running) {
+        line(CONTENT_Y + 78, T("Status: Jamming", "Trạng thái: Đang jam"), UI_RED);
+        line(CONTENT_Y + 104, "Channel: " + String(nrf24Channel), UI_TXT);
+    } else {
+        line(CONTENT_Y + 78, T("Status: Idle", "Trạng thái: Chờ"), UI_GREEN);
+    }
+}
+
+void nrf24Tick() {
+    if (!nrf24Running) return;
+    switch (nrf24Method) {
+        case 0: nrf24JamList(); break;
+        case 1: nrf24JamRandom(); break;
+        case 2: nrf24JamBruteforce(); break;
+    }
+    delayMicroseconds(300);
+}
+
+void nrf24Press() {
+    if (!nrf24Active) return;
+    if (nrf24Running) {
+        nrf24Running = false;
+        radio.stopConstCarrier();
+        radio.powerDown();
+    } else {
+        nrf24Running = true;
+        radio.powerUp();
+        radio.setChannel(0);
+        radio.startConstCarrier(RF24_PA_MAX, nrf24Channel);
+    }
+    nrf24Enter();
+}
+
+void nrf24Rotate(int dir) {
+    if (nrf24Running) return;
+    nrf24Method = (nrf24Method + dir + 3) % 3;
+    nrf24Enter();
+}
+
+enum Icon { ICON_TIMER, ICON_WEATHER, ICON_NAV, ICON_DOC, ICON_PHONE, ICON_WIFI, ICON_RGB, ICON_HOTSPOT, ICON_MIC, ICON_REC, ICON_ASK, ICON_SETTINGS, ICON_MARKET, ICON_BELL, ICON_INFO, ICON_NRF24 };
 
 struct App {
     const char *name, *nameVi;
@@ -2992,6 +3094,7 @@ const App APPS[] = {
     {"Recorder", "Ghi âm", ICON_REC, recEnter, recTick, recPress},
     {"Settings", "Cài đặt", ICON_SETTINGS, settingsEnter, nullptr, settingsPress},
     {"Info", "Thông tin", ICON_INFO, infoEnter, infoTick, nullptr},
+    {"nRF24 Jammer", "nRF24 Jammer", ICON_NRF24, nrf24Enter, nrf24Tick, nrf24Press},
 };
 const int APP_COUNT = sizeof(APPS) / sizeof(APPS[0]);
 // Indices looked up by entry function, so reordering the list never breaks them.
@@ -3037,6 +3140,7 @@ uint16_t iconColor(Icon icon) {
         case ICON_SETTINGS: return rgb565(142, 142, 147);
         case ICON_MARKET: return rgb565(255, 179, 0);
         case ICON_BELL: return rgb565(255, 59, 48);
+        case ICON_NRF24: return rgb565(0, 180, 120);
         default: return rgb565(99, 120, 160);
     }
 }
@@ -3136,7 +3240,12 @@ void drawIcon(Icon icon, int cx, int cy) {
             break;
         case ICON_INFO: // an "i"
             tft.fillCircle(cx, cy - 6, 2, c);
-            tft.fillRoundRect(cx - 1, cy - 2, 3, 10, 1, c);
+            tft.drawFastVLine(cx, cy - 1, 8, c);
+            break;
+        case ICON_NRF24: // radio waves
+            tft.drawCircle(cx, cy, 4, c);
+            tft.drawCircle(cx, cy, 8, c);
+            tft.drawCircle(cx, cy, 12, c);
             break;
     }
 }
